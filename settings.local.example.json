@@ -27,13 +27,14 @@
   },
 
   "schedule": {
-    "_说明": "调度器设置；albumsFile 相对项目根目录",
+    "_说明": "调度器设置；albumsFile 相对项目根目录。retryMinutes × maxRetries = 「短试」预算（默认 30 分钟 × 6 = 3 小时），用尽后按 backoffAt 退避到次日该时刻 —— 因为额度按自然日重置，盲试没用",
     "albumsFile": "config/albums.txt",
     "intervalHours": 12,
     "concurrency": 3,
     "slow": false,
     "retryMinutes": 30,
-    "maxRetries": 24
+    "maxRetries": 6,
+    "backoffAt": "00:05"
   },
 
   "dns": {

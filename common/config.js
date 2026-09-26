@@ -52,6 +52,9 @@ const ENV_MAP = {
   XMD_SCHEDULE_RUN_ON_START: ['schedule', 'runOnStart'],
   XMD_SCHEDULE_RETRY_MINUTES: ['schedule', 'retryMinutes'],
   XMD_SCHEDULE_MAX_RETRIES: ['schedule', 'maxRetries'],
+  // 短试用尽后退避到次日哪个时刻（"HH:MM"，默认 00:05）。
+  // 注意 coerce() 会把纯数字字符串转成 number，所以 scheduler 里取用时统一 String() 一遍。
+  XMD_SCHEDULE_BACKOFF_AT: ['schedule', 'backoffAt'],
   // DNS 兜底相关，见 common/dnsfix.js
   XMD_DNS_ENABLED: ['dns', 'enabled'],
   XMD_DNS_SERVERS: ['dns', 'servers'],

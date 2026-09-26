@@ -168,9 +168,44 @@ async function runOnce(ids, opts) {
         }
     }
     const mins = ((Date.now() - begun) / 60000).toFixed(1)
-    log.info(`本轮结束：成功 ${ok} 个，失败 ${fail} 个，耗时 ${mins} 分钟${aborted ? '（被暂停打断）' : ''}`)
+    // 「秒级失败」是个很值钱的指纹：getDownloader 取不到播放地址就直接抛、整张专辑退出，
+    // 所以耗时 <1 分钟基本等于「一进去就被挡」= 限流 / 额度耗尽，不是凭据或网络问题。
+    // 2026-09-26 那次整夜 0 集，日志全是「耗时 0.1 分钟」——当时没能一眼看出来。
+    const quickFail = fail > 0 && Number(mins) < 1
+    log.info(`本轮结束：成功 ${ok} 个，失败 ${fail} 个，耗时 ${mins} 分钟`
+        + `${aborted ? '（被暂停打断）' : ''}`
+        + `${quickFail ? '　← 秒级失败：第一集就被挡，通常是限流/额度耗尽，不是凭据问题' : ''}`)
     state.lastRound = {ok, fail, minutes: Number(mins), at: Date.now(), aborted}
     return {ok, fail, aborted}
+}
+
+/**
+ * 距离「下一天的某个时刻」还有多久（毫秒）。
+ *
+ * 用途：撞上自然日额度后，退避到次日 00:05 再试 —— 而不是 30 分钟一次地盲试。
+ * 今天这个时刻已经过了就取明天的。容器里 TZ=Asia/Shanghai，所以 new Date()
+ * 拿到的就是本地时间，不用额外换算。
+ *
+ * @param {string} hhmm 形如 "00:05"
+ * @returns {{ms:number,label:string}|null} 格式不对返回 null
+ */
+function msUntilNextDayWindow(hhmm) {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm).trim())
+    if (!m) return null
+    const h = Number(m[1])
+    const min = Number(m[2])
+    if (h > 23 || min > 59) return null
+    const now = new Date()
+    const target = new Date(now)
+    target.setHours(h, min, 0, 0)
+    if (target.getTime() <= now.getTime()) {
+        target.setDate(target.getDate() + 1)
+    }
+    const pad = n => String(n).padStart(2, '0')
+    return {
+        ms: target.getTime() - now.getTime(),
+        label: `${target.getMonth() + 1}/${target.getDate()} ${pad(h)}:${pad(min)}`,
+    }
 }
 
 function resolveHome(p) {
@@ -222,12 +257,20 @@ async function main() {
         dryRun: process.argv.includes('--dry-run'),
     }
     const intervalHours = Number(sched.intervalHours) > 0 ? Number(sched.intervalHours) : 12
-    // 失败后的短间隔重试。多为账号级「整点重置」的额度用尽，几十集到几百集就跑满，
-    // 睡满 intervalHours 等于白扔好几个窗口，所以先密集重试几轮。
+    // 失败后的**短间隔**重试。默认 30 分钟一次，最多 6 次（= 3 小时）。
+    // 3 小时足够覆盖「瞬时 / 小时级」风控；再往下试也不会好，见下面的退避。
     const retryMinutes = Number(sched.retryMinutes) > 0 ? Number(sched.retryMinutes) : 30
-    // 默认 24 次 = 12 小时。别调小：额度是整点重置的，一次跨时段的限流很容易
-    // 把 6 次（3 小时）用光，然后就睡满 intervalHours —— 实测这样会白扔一整夜。
-    const maxRetries = Number(sched.maxRetries) > 0 ? Number(sched.maxRetries) : 24
+    // 短试次数上限。**2026-09-27 起语义变了**：以前是「总重试次数」（曾设 24 = 12 小时），
+    // 现在是「短试次数」，超限后不再空转，交给下面的 backoffAt 退避。
+    const maxRetries = Number(sched.maxRetries) > 0 ? Number(sched.maxRetries) : 6
+    // 短试用完还没起来 —— 大概率是撞了**自然日额度**（实测：约 1000 集/日，跨整点不恢复，
+    // 只有跨过 0 点才回）。这时继续 30 分钟一次地盲试纯属浪费，直接退避到次日这个时刻。
+    // 实测 2026-09-27 00:01 唤醒即恢复，所以取 00:05 留几分钟余量。
+    // 设成空串 / off 可关掉，退化为原来的「回到 intervalHours 常规周期」。
+    const rawBackoff = sched.backoffAt === undefined || sched.backoffAt === null
+        ? '00:05'
+        : String(sched.backoffAt).trim()
+    const backoffAt = /^off$/i.test(rawBackoff) ? '' : rawBackoff
     const albumsFile = sched.albumsFile
         ? path.resolve(projectRoot, sched.albumsFile)
         : path.join(projectRoot, 'albums.txt')
@@ -238,7 +281,10 @@ async function main() {
     log.info(`订阅列表：${albumsFile}`)
     log.info(`并发：${opts.slow ? '慢速模式（串行）' : opts.concurrency}　扫描间隔：${intervalHours} 小时` +
         (opts.dryRun ? '　【试运行，不会真的下载】' : ''))
-    log.info(`失败重试：${retryMinutes} 分钟一次，最多连续 ${maxRetries} 次，之后回到常规周期`)
+    log.info(`失败重试：${retryMinutes} 分钟一次 × ${maxRetries} 次`
+        + (backoffAt
+            ? `；仍失败则退避到每天 ${backoffAt}（额度按自然日重置）`
+            : '，之后回到常规周期'))
 
     // 网页控制台放在凭据校验**之前**启动。凭据没配好时恰恰最需要一个能看状态和
     // 日志的页面，而不是让人去翻 docker logs。--once 模式跑完就退，没必要开端口。
@@ -317,28 +363,39 @@ async function main() {
             break
         }
 
-        // 额度是整点重置的，所以失败后先短间隔重试，别一觉睡到大天亮。
-        // 连续若干轮都失败说明不是额度问题（凭据失效、平台改接口），
-        // 那就回到常规周期，别一直空转刷日志。
-        let waitMinutes = intervalHours * 60
+        // 三段式退避（2026-09-27 重做。之前是「30 分钟盲试 24 次」，实测会白扔一整天）：
+        //   ① 本轮成功          → intervalHours 常规周期
+        //   ② 失败、短试没用完   → retryMinutes 短试（覆盖瞬时 / 小时级风控）
+        //   ③ 失败、短试已用尽   → 退避到次日 backoffAt（撞的是自然日额度，盲试毫无意义）
+        let waitMs = intervalHours * 60 * 60 * 1000
         let note = ''
         if (failed > 0 && consecutiveFailures < maxRetries) {
             consecutiveFailures++
-            waitMinutes = retryMinutes
-            note = `【失败，第 ${consecutiveFailures}/${maxRetries} 次快速重试】`
+            waitMs = retryMinutes * 60 * 1000
+            note = `【失败，第 ${consecutiveFailures}/${maxRetries} 次短试】`
         } else if (failed > 0) {
-            note = `【已连续 ${consecutiveFailures} 轮失败，改回常规周期 —— 请查日志确认不是凭据或接口问题】`
-            consecutiveFailures = 0
+            // 注意 consecutiveFailures **继续累加**，别清零 —— 清零会让它退回去重新短试，
+            // 于是每天都要空转 3 小时。只有真的成功了才归零。
+            consecutiveFailures++
+            const w = backoffAt ? msUntilNextDayWindow(backoffAt) : null
+            if (w) {
+                waitMs = w.ms
+                note = `【已连续 ${consecutiveFailures} 轮失败，短试已用尽 → 退避到 ${w.label}】`
+                    + ` 额度按自然日重置（实测约 1000 集/日，跨整点不恢复）；届时仍失败请查凭据或接口`
+            } else {
+                note = `【已连续 ${consecutiveFailures} 轮失败，退回常规周期 —— 请查日志确认不是凭据或接口问题】`
+                consecutiveFailures = 0
+            }
         } else {
             consecutiveFailures = 0
         }
 
-        const human = waitMinutes >= 60
-            ? `${(waitMinutes / 60).toFixed(1)} 小时`
-            : `${waitMinutes} 分钟`
+        const human = waitMs >= 3600000
+            ? `${(waitMs / 3600000).toFixed(1)} 小时`
+            : `${Math.round(waitMs / 60000)} 分钟`
         log.info(`休眠 ${human} 后再来 ${note}`)
         const interrupted = await sleepInterruptible(
-            waitMinutes * 60 * 1000,
+            waitMs,
             `休眠 ${human}后进入第 ${round + 1} 轮 ${note}`.trim())
         if (interrupted) {
             log.info('休眠被「继续 / 立即跑一轮」打断，马上开始下一轮')

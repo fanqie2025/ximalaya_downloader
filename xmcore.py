@@ -78,7 +78,8 @@ DEFAULT_SETTINGS = {
         "concurrency": 3,
         "slow": False,
         "retryMinutes": 30,
-        "maxRetries": 24,
+        "maxRetries": 6,
+        "backoffAt": "00:05",
     },
 }
 
