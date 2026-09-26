@@ -1,3 +1,55 @@
+> ## ⚠️ 这是 fork，不是原作
+>
+> 本仓库是 **[844704781/ximalaya_downloader](https://github.com/844704781/ximalaya_downloader)**
+> 的二次开发（fork）。**原作者是 [@844704781](https://github.com/844704781)**。
+> 上游采用 **AGPL-3.0** 许可，本仓库同样以 AGPL-3.0 发布，并保留原始 `LICENSE` 与全部版权声明。
+> 登录、解密、接口调用等核心逻辑均出自原作者 —— 本仓库只做了下面这些增强。
+> **如果这工具帮到你，请去给上游点个 star。**
+>
+> ### 本仓库加了什么
+>
+> | 能力 | 说明 |
+> |---|---|
+> | 🖥️ **网页控制台** | `http://<主机IP>:8787/` —— 加订阅 ID、看每张专辑进度、暂停/继续、翻日志。与调度器同进程 |
+> | 🐳 **Docker 无人值守** | 常驻追更订阅列表，Windows 可以关机。失败按 30 分钟短间隔重试（额度是整点重置的） |
+> | 🔑 **一键采设备指纹** | 付费/VIP 声音需要设备指纹。用真实浏览器普通启动 + CDP 读取，**不必手按 F12** |
+> | 🔊 **音质档位** | 上游固定取最优质；本仓可切 high / standard / low，付费声音暴露 `trackQualityLevel` |
+> | 📁 **目录命名模板** | `《书名》主播 作者` 等，对齐 Audiobookshelf 的库结构 |
+> | 🔢 **序号补零** | 落成 `0001.mp3` 而不是 `1.mp3`，否则 ABS 按字典序排成 1→10→11→2，听书顺序全乱 |
+> | 🩹 **几个坑的修补** | 代理环境变量让 axios 报 400、DNS 把风控域名打成 `0.0.0.0`、catch 吞掉真实异常、进度库里的「幽灵记录」 |
+>
+> ### 快速开始
+>
+> ```bash
+> git clone <本仓库地址>
+> cd ximalaya_downloader
+> npm config set registry https://registry.npmmirror.com   # 国内必须，否则 ECONNRESET
+> npm install --no-audit --no-fund
+>
+> cp settings.local.example.json settings.local.json        # 改下载目录
+> cp config/albums.txt.example config/albums.txt            # 填要追更的专辑
+>
+> node login.js                        # 扫码登录一次，凭据存 ~/.xmd/
+> node xmd.js -a 22216262 --dry-run    # 先试运行，只报目录名和待下载数，不真下
+> node xmd.js -a 22216262
+> ```
+>
+> 走 Docker + 网页面板的话，见 `docker-compose.yml` 顶部的注释（那里写了部署前要先准备什么）。
+>
+> ### 🔒 凭据与指纹不会进仓库
+>
+> `.gitignore` 已排除 `~/.xmd/`、`*cookie*`、`device-info.json`、`settings.local.json`、
+> `config/albums.txt`、`config/albums.meta.json` 等。
+> **扫码拿到的 cookie 等于你的账号，设备指纹泄漏会被风控盯上** —— 都不要提交。
+> clone 下来照着 `*.example` 各填一份即可。
+>
+> ### 合规
+>
+> 本工具**不破解付费内容**，能下什么完全取决于你自己账号的权限，仅供个人离线收听。
+> 下载的音频请勿再分发。详见文末「合规边界」。
+>
+> ---
+
 <h1 align="center">喜马拉雅下载工具</h1>
 <h4 align="center">ximalaya-downloader</h4>
 

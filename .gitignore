@@ -46,3 +46,38 @@ qrcode.png
 .DS_Store
 
 package-lock.json
+# ================= 以下为本仓（fork 后的二次开发）补充 =================
+#
+# 原则：**凭据、指纹、个人配置、大体积二进制一律不进仓库**。
+# clone 下来的人照着 *.example 各填一份就能跑。
+
+# --- 凭据与设备指纹：泄漏 cookie 等于把账号送人；指纹泄漏会被风控盯上 ---
+**cookie**
+**qrcode**
+device-info.json
+_device-info.collected.json
+
+# --- 登录凭据 + 设备指纹 + 进度库（容器里挂在 ./xmd，本机在 ~/.xmd）---
+xmd/
+
+# --- 个人配置与订阅列表：仓库里只留 .example 模板 ---
+settings.local.json
+config/albums.txt
+config/albums.meta.json
+
+# --- 体积：node/ 100M、下载/ 154M、exe 12M，进 git 只会把仓库撑爆 ---
+node/
+下载/
+*.exe
+
+# --- Python ---
+__pycache__/
+*.pyc
+
+# --- 本机面板截图 ---
+panel-preview.png
+
+# package-lock.json：上游的 .gitignore 里写了忽略，但它**早已被追踪**
+# （gitignore 管不了已追踪的文件），这里显式声明保留 —— Dockerfile 走的是
+# 「宿主机装好再 COPY」，少了它复现出来的依赖树就不是同一棵
+!package-lock.json

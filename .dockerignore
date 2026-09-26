@@ -1,0 +1,24 @@
+inherit
+.venv
+node
+build
+logs
+下载
+.git
+.gitattributes
+*.exe
+*.cmd
+*.ps1
+*.py
+_*.mjs
+_test_*.mjs
+_probe_*.py
+rebuild.*
+喜马拉雅下载器.exe
+# 本机专用：容器里没有浏览器，采集脚本和采集产物都用不上。
+# 注意别图省事写成 _*.js —— 容器里查故障要靠 _diag.js，那个得留着。
+collect-fingerprint.js
+_device-info.collected.json
+_one.js
+_verify.js
+# 注意：这里**不要**排除 node_modules —— 依赖是宿主机上装好再拷进镜像的

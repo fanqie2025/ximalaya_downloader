@@ -333,9 +333,40 @@ class AbstractDownloader {
     }
 
     /**
+     * 拿主播名。
+     *
+     * simple 接口的 albumPageMainInfo 里通常直接有 anchorName；缺失时退回
+     * revision/album 的 anchorInfo.anchorName。
+     *
+     * 「作者」平台**不提供**，不在这里找：simple、tdk-web seo、m-revision
+     * queryAlbumPage、专辑 HTML 页（全文搜 author 命中 0 次）、revision/album
+     * 五路都测过，只有主播一个字段。要作者只能手工登记，见 common/naming.js。
+     * @private
+     */
+    async _getAnchorName(albumId, simpleMain) {
+        if (simpleMain && simpleMain.anchorName) {
+            return String(simpleMain.anchorName)
+        }
+        try {
+            const url = `${config.baseUrl}/revision/album?albumId=${albumId}`
+            const referer = `${config.baseUrl}/album/${albumId}`
+            const headers = buildHeaders(referer, await this._getCookies())
+            const response = await iaxios.get(url, {headers: headers})
+            const anchor = response && response.data && response.data.data &&
+                response.data.data.anchorInfo
+            if (anchor && anchor.anchorName) {
+                return String(anchor.anchorName)
+            }
+        } catch (e) {
+            log.debug('取主播名失败：', e.message)
+        }
+        return ''
+    }
+
+    /**
      * 获取专辑详情
      * @param albumId
-     * @returns {Promise<{trackCount, albumTitle, isFinished}>}
+     * @returns {Promise<{trackCount, albumTitle, isFinished, anchorName}>}
      */
     async getAlbum(albumId) {
         if (albumId == null) {
@@ -344,10 +375,12 @@ class AbstractDownloader {
         const simple = await this._getAlbumSimple(albumId, await this._getCookies())
         const info = await this._getAlbumInfo(albumId, await this._getCookies())
         const book = await this.getTracksList(albumId, 1, 1)
+        const main = simple['albumPageMainInfo'] || {}
         return {
             albumId: albumId,
-            albumTitle: simple['albumPageMainInfo']['albumTitle'],
-            isFinished: simple['albumPageMainInfo']['isFinished'],
+            albumTitle: main['albumTitle'],
+            isFinished: main['isFinished'],
+            anchorName: await this._getAnchorName(albumId, main),
             trackCount: book.trackTotalCount
         }
     }
@@ -411,7 +444,7 @@ class AbstractDownloader {
             throw new Error("喜马拉雅内部异常")
         }
         const info = response.data
-        const playUrl = info.playPathHq || info.downloadUrl || info.playUrl64 || info.playUrl32
+        const playUrl = this._pickFreePlayUrl(info)
         if (playUrl == null || playUrl == '') {
             // 付费声音这里只有时长和体积，地址要另走带签名的加密接口
             return {
@@ -447,7 +480,7 @@ class AbstractDownloader {
      */
     async _getPaidPlayUrl(trackId) {
         const {xmSign, userAgent} = await getXmSign()
-        const url = `${config.baseUrl}/mobile-playpage/track/v3/baseInfo/${Date.now()}?device=${this.playDeviceType}&trackId=${trackId}&trackQualityLevel=1`
+        const url = `${config.baseUrl}/mobile-playpage/track/v3/baseInfo/${Date.now()}?device=${this.playDeviceType}&trackId=${trackId}&trackQualityLevel=${this._paidLevel()}`
         const headers = buildHeaders(`${config.baseUrl}/`, await this._getPaidCookies())
         headers['User-Agent'] = userAgent
         headers['Origin'] = config.baseUrl
@@ -510,23 +543,61 @@ class AbstractDownloader {
     }
 
     /**
+     * 音质档位：high | standard | low | auto
+     * 默认 auto —— 与上游行为逐字一致（playPathHq 优先）。
+     */
+    _qualityMode() {
+        const m = config.quality && config.quality.mode
+        return (m === 'high' || m === 'standard' || m === 'low') ? m : 'auto'
+    }
+
+    /**
+     * 付费声音的音质参数 trackQualityLevel。
+     * 上游原值写死为 1，这里改成可配；取值语义平台未公开，故默认保持 1 不动。
+     */
+    _paidLevel() {
+        const v = config.quality && config.quality.paidLevel
+        return Number.isFinite(Number(v)) ? Number(v) : 1
+    }
+
+    /**
+     * 免费声音的下载地址挑选。
+     *
+     * 平台对同一条声音给出多个档位字段，按所选档位改变优先顺序。
+     * 关键：**任何一档缺失都继续往下一档回退**，所以不会因为选了个平台
+     * 没提供的档位就拿不到地址。auto 一行与上游原写法完全等价。
+     */
+    _pickFreePlayUrl(info) {
+        const chain = {
+            high: [info.playPathHq, info.downloadUrl, info.playUrl64, info.playUrl32],
+            standard: [info.playUrl64, info.playPathHq, info.downloadUrl, info.playUrl32],
+            low: [info.playUrl32, info.playUrl64, info.playPathHq, info.downloadUrl],
+            auto: [info.playPathHq, info.downloadUrl, info.playUrl64, info.playUrl32],
+        }[this._qualityMode()]
+        for (const u of chain) {
+            if (u != null && u !== '') {
+                return u
+            }
+        }
+        return null
+    }
+
+    /**
      * 获取解密参数
-     * @param t
+     * @param t playUrlList
      * @returns {*}
      */
     _playUrl = (t) => {
-        let e, r = {}, n = 1;
-        return r.mediaType && t.some((function (t) {
-                return t.type.indexOf(r.mediaType) >= 0 && (e = t.url,
-                    !0)
-            }
-        )),
-        e || (e = t[0].url),
-        t && t.length && (n = t[0].qualityLevel),
-            {
-                qualityLevel: n,
-                encodeText: e
-            }
+        // 上游原逻辑恒取 t[0]。这里多加一层：列表里存在与目标档位相等的条目就选它，
+        // 找不到则原样回退到 t[0] —— 行为不会比上游更差。
+        const hit = Array.isArray(t)
+            ? t.find(x => Number(x.qualityLevel) === Number(this._paidLevel()))
+            : null
+        const item = hit || t[0]
+        return {
+            qualityLevel: item.qualityLevel,
+            encodeText: item.url
+        }
     }
 
     /**

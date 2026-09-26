@@ -1,0 +1,76 @@
+# 喜马拉雅自动下载 —— 跑在飞牛 fnOS 上，Windows 可以关机。
+#
+# 项目目录：飞牛 /vol2/1000/docker/ximalaya-auto/
+#   飞牛的 docker 项目统一放 /vol2/1000/docker/ 下（同目录还有 audiobookshelf、
+#   pansou1、xianyu 等 20 来个）。注意**只放项目本身**：
+#   下载产物在 /vol1/1000/youshengshu（ABS 媒体库），那块盘有 1.4T 空余，
+#   而 /vol2 只剩十几 G，绝对不要把下载目录改到 /vol2。
+#
+# ⚠️ 部署前必须先准备，尤其是凭据：
+#   1) 在**有屏幕的 Windows** 上跑一次  node login.js  扫码登录
+#   2) 把 C:\Users\<你>\.xmd 里的文件拷进本目录的 xmd/
+#   3) 本目录的 config/ 下要有这两个**文件**（挂的是目录，但容器里读的是文件，
+#      缺了不会报错、只会静默按「没有订阅」处理）：
+#          config/albums.txt          订阅列表
+#          config/albums.meta.json    手工元数据（作者）
+#
+# 启动：      docker compose -p ximalaya-auto up -d --build
+# 看日志：    docker compose -p ximalaya-auto logs -f
+# 手动跑一轮：docker compose -p ximalaya-auto exec ximalaya-auto node scheduler.js --once
+# 试运行：    docker compose -p ximalaya-auto exec ximalaya-auto node scheduler.js --once --dry-run
+#
+# 网页控制台：http://<飞牛IP>:8787/  —— 加订阅、看进度、暂停/继续。
+#   网页和调度器跑在同一个进程里（由 scheduler.js 拉起，不是独立容器），
+#   这样才能共享暂停状态、并且掐得掉正在下载的子进程。
+#
+# 加订阅：网页上填，或者直接编辑 config/albums.txt，一行一个专辑 ID 或链接。
+#   两种方式下一轮都自动生效，不用重启。
+services:
+  ximalaya-auto:
+    build: .
+    image: ximalaya-auto:local
+    container_name: ximalaya-auto
+    restart: unless-stopped
+    # 常驻进程 + 子进程，交给 init 收尸，避免僵尸进程堆积
+    init: true
+    ports:
+      # 网页控制台。飞牛上 8787 是空的（已确认没被别的容器占）。
+      # 只打算在局域网里用，面板没有登录鉴权 —— 介意的话用防火墙挡住外网即可。
+      - "8787:8787"
+    environment:
+      TZ: Asia/Shanghai
+      # 同一份镜像要在本机和飞牛两处跑，差异只在下载目录和调度参数，用环境变量注入
+      XMD_ARCHIVES: /downloads
+      XMD_WEB_PORT: "8787"
+      XMD_SCHEDULE_ALBUMS_FILE: config/albums.txt
+      XMD_SCHEDULE_INTERVAL_HOURS: "12"
+      # 无人值守建议压低并发，别被平台风控
+      XMD_SCHEDULE_CONCURRENCY: "3"
+      # 慢速模式：并发 1，且每集之间随机等 0.5~5 秒。
+      # 实测快速模式下 1589 集的专辑 3~4 秒能下 10 集，日志自己都在警告
+      # 「当前为快速模式,很容易被官方大大踢屁屁哦」。无人值守最怕的就是跑到一半
+      # 被限流，那样后面整晚都白跑，所以这里主动放慢 —— 剩下的量也就一小时的差别。
+      # 想换回快的：改成 "false" 或者删掉这一行。
+      XMD_SCHEDULE_SLOW: "true"
+      # 失败后的短间隔重试。账号级额度约 400 集/小时、**整点重置**，
+      # 一轮跑满就被限流，睡满 12 小时等于白扔窗口，所以失败先密集重试。
+      #
+      # maxRetries 为什么是 24 而不是 6（2026-09-26 实测修正）：
+      #   6 次 × 30 分钟 = 3 小时，扛不住一次跨时段的限流。实测 01:43 那次失败
+      #   把 6 次用完 → 退回 12 小时常规周期 → 02:00 额度其实已经恢复了，却要等到
+      #   13:43 才再试，**中间白扔 11 个整点窗口，整夜 0 集**。
+      #   调到 24 次（12 小时，每 30 分钟试一次），只要撞上额度恢复就自动接着下。
+      #   24 次全失败说明不是限流（多半是凭据失效或平台改接口），那时睡 12 小时是合理的。
+      XMD_SCHEDULE_RETRY_MINUTES: "30"
+      XMD_SCHEDULE_MAX_RETRIES: "24"
+      # 占位符：{title} {anchor} {author} {count} {status}
+      XMD_NAMING_TEMPLATE: "《{title}》{anchor} {author}"
+    volumes:
+      # 登录凭据 + 下载进度数据库。必须持久化，否则每次重建容器都要重下全部
+      - ./xmd:/root/.xmd
+      # 订阅列表 + 手工元数据，整个目录挂，别单文件挂（宿主机上文件不存在时
+      # Docker 会创建一个同名目录，容器里读到目录直接报错）
+      - ./config:/app/config
+      - ./logs:/app/logs
+      # 直接下进 ABS 媒体库，省掉「下完再推送」那一步
+      - /vol1/1000/youshengshu:/downloads

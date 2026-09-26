@@ -1,0 +1,20 @@
+{
+  "_说明": [
+    "用法：复制成同目录下的 albums.meta.json 再改。",
+    "  cp config/albums.meta.json.example config/albums.meta.json",
+    "",
+    "平台不提供「作者」字段 —— simple / tdk-web seo / m-revision queryAlbumPage /",
+    "专辑 HTML 页 / revision/album 五路接口实测均无，只有主播 anchorName。",
+    "想按作者归档就在这里手工登记。",
+    "",
+    "格式：键是 albumId（字符串），值是对象，目前只用到 author 一个字段。",
+    "  比如要登记专辑 30816438 的作者是刘慈欣，就写成：",
+    "  \"30816438\": { \"author\": \"刘慈欣\" }",
+    "",
+    "登记后目录名模板里的 {author} 才会被填上。",
+    "也可以靠 naming.authorGuess 从标题里猜（三段式 作者｜书名｜类型 能猜出来），",
+    "猜不出再回到这里手工登记。",
+    "",
+    "注意：仓库里忽略真实的 albums.meta.json，只保留本模板。"
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "_说明": [
+    "用法：复制成项目根目录下的 settings.local.json 再改。",
+    "  cp settings.local.example.json settings.local.json",
+    "",
+    "为什么单独一个文件：不写进上游的 config.json，这样上游更新时不会把设置冲掉。",
+    "common/config.js 的合并顺序是 config.json → settings.local.json → 环境变量，",
+    "环境变量优先级最高 —— 同一个镜像要在本机和飞牛容器里跑不同配置时靠它。",
+    "",
+    "平台不提供「作者」字段，想按作者归档要手工登记 config/albums.meta.json。",
+    "注意：仓库里忽略真实的 settings.local.json，只保留本模板。"
+  ],
+
+  "archives": "G:/ximalayaxiazai/下载",
+
+  "quality": {
+    "_说明": "mode 可选 high / standard / low；paidLevel 是付费声音的 trackQualityLevel",
+    "mode": "high",
+    "paidLevel": 1
+  },
+
+  "naming": {
+    "_说明": "占位符 {title} {anchor} {author} {count} {status}；padWidth 是序号补零位宽",
+    "template": "《{title}》{anchor} {author}",
+    "padWidth": 4,
+    "authorGuess": true
+  },
+
+  "schedule": {
+    "_说明": "调度器设置；albumsFile 相对项目根目录",
+    "albumsFile": "config/albums.txt",
+    "intervalHours": 12,
+    "concurrency": 3,
+    "slow": false,
+    "retryMinutes": 30,
+    "maxRetries": 24
+  },
+
+  "dns": {
+    "_说明": "系统 DNS 把数盟风控域名打成 0.0.0.0/:: 时的兜底（详见 README 常见问题）",
+    "enabled": true,
+    "servers": ["223.5.5.5", "119.29.29.29", "114.114.114.114"]
+  }
+}

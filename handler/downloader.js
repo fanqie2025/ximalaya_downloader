@@ -104,6 +104,10 @@ class DownloaderFactory {
             try {
                 return await cb(item.downloader)
             } catch (e) {
+                // 上游这里只留一个 isLimit 标记，把真实异常丢掉，最后统一抛
+                // 「所有下载方式都受限了」—— 于是「缺少设备指纹文件」这种
+                // 一眼能修的错误也被糊成「被风控」，排查全靠猜。这里补一行。
+                log.warn(`${item.downloader.deviceType} 渠道不可用：${e.message}`)
                 item.isLimit = true
                 continue
             }
