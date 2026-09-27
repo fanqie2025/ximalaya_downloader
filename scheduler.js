@@ -51,6 +51,12 @@ function childEnv() {
 
 let currentChild = null
 
+// 本轮**真正下到**的集数。
+// 必须认「下载成功」这三个字：日志里还有「当前信息>>>>>进度:」这类同样能匹配
+// RE_PROGRESS 的行（专辑已下完时每轮都会打一行），只按 RE_PROGRESS 数会虚高 ——
+// 2026-09-27 核查时踩到：`grep '进度:'` 数出 821，真实只有 807。
+let roundDownloaded = 0
+
 // 子进程进度行长这样：
 //   (web)下载成功＞＞＞＞＞进度:12.34%(196/1589)---->/downloads/《书名》主播 作者/0001.mp3
 const RE_PROGRESS = /进度:([\d.]+)%\((\d+)\/(\d+)\)/
@@ -94,6 +100,7 @@ function onChildLine(line) {
     pushLog(line)
     const p = line.match(RE_PROGRESS)
     if (p) {
+        if (line.includes('下载成功')) roundDownloaded++
         state.phase = 'running'
         const t = line.match(RE_TARGET)
         state.current = {
@@ -148,6 +155,7 @@ function runAlbum(albumId, opts) {
 
 async function runOnce(ids, opts) {
     const begun = Date.now()
+    roundDownloaded = 0
     let ok = 0
     let fail = 0
     let aborted = false
@@ -168,14 +176,19 @@ async function runOnce(ids, opts) {
         }
     }
     const mins = ((Date.now() - begun) / 60000).toFixed(1)
+    const got = roundDownloaded
     // 「秒级失败」是个很值钱的指纹：getDownloader 取不到播放地址就直接抛、整张专辑退出，
     // 所以耗时 <1 分钟基本等于「一进去就被挡」= 限流 / 额度耗尽，不是凭据或网络问题。
     // 2026-09-26 那次整夜 0 集，日志全是「耗时 0.1 分钟」——当时没能一眼看出来。
+    //
+    // 判定阈值**故意不改成「本轮 0 集」**：实测 2026-09-27 那几轮里，跑了 15 分钟、
+    // 下了 301 集才被挡的轮次根因同样是额度耗尽，但它们不属于「第一集就被挡」。
+    // 那种情况靠上面那个「新增 N 集」区分：一集没捞到才是真的一进去就被挡。
     const quickFail = fail > 0 && Number(mins) < 1
-    log.info(`本轮结束：成功 ${ok} 个，失败 ${fail} 个，耗时 ${mins} 分钟`
+    log.info(`本轮结束：成功 ${ok} 个，失败 ${fail} 个，新增 ${got} 集，耗时 ${mins} 分钟`
         + `${aborted ? '（被暂停打断）' : ''}`
         + `${quickFail ? '　← 秒级失败：第一集就被挡，通常是限流/额度耗尽，不是凭据问题' : ''}`)
-    state.lastRound = {ok, fail, minutes: Number(mins), at: Date.now(), aborted}
+    state.lastRound = {ok, fail, minutes: Number(mins), at: Date.now(), aborted, downloaded: got}
     return {ok, fail, aborted}
 }
 
@@ -369,26 +382,37 @@ async function main() {
         //   ③ 失败、短试已用尽   → 退避到次日 backoffAt（撞的是自然日额度，盲试毫无意义）
         let waitMs = intervalHours * 60 * 60 * 1000
         let note = ''
+        let stage = 'normal'
         if (failed > 0 && consecutiveFailures < maxRetries) {
             consecutiveFailures++
+            stage = 'short-retry'
             waitMs = retryMinutes * 60 * 1000
-            note = `【失败，第 ${consecutiveFailures}/${maxRetries} 次短试】`
+            // 措辞说明（2026-09-27 核查后改）：N 记的是**接下来这次**短试的序号，
+            // 不是「刚刚失败的是第 N 次」—— 首次失败时也打 1/6，以前写「第 1/6 次短试」
+            // 会被误读成「第 1 次重试」，让人以为计数器从 0 起。
+            note = `【本轮失败 → 接下来第 ${consecutiveFailures}/${maxRetries} 次短试】`
         } else if (failed > 0) {
             // 注意 consecutiveFailures **继续累加**，别清零 —— 清零会让它退回去重新短试，
             // 于是每天都要空转 3 小时。只有真的成功了才归零。
             consecutiveFailures++
+            stage = 'backoff'
             const w = backoffAt ? msUntilNextDayWindow(backoffAt) : null
             if (w) {
                 waitMs = w.ms
-                note = `【已连续 ${consecutiveFailures} 轮失败，短试已用尽 → 退避到 ${w.label}】`
+                // 把 N 的构成写出来，省得再有人问「为什么是 7 而不是 6」
+                note = `【已连续失败 ${consecutiveFailures} 轮（首轮 + ${maxRetries} 次短试已用尽）→ 退避到 ${w.label}】`
                     + ` 额度按自然日重置（实测约 1000 集/日，跨整点不恢复）；届时仍失败请查凭据或接口`
             } else {
-                note = `【已连续 ${consecutiveFailures} 轮失败，退回常规周期 —— 请查日志确认不是凭据或接口问题】`
+                note = `【已连续失败 ${consecutiveFailures} 轮，退回常规周期 —— 请查日志确认不是凭据或接口问题】`
                 consecutiveFailures = 0
+                stage = 'normal'
             }
         } else {
             consecutiveFailures = 0
         }
+
+        // 退避状态挂到 state 上，网页面板 / api 直接读得到（不用 ssh 翻日志）
+        state.sched = {stage, consecutiveFailures, maxRetries, retryMinutes, backoffAt}
 
         const human = waitMs >= 3600000
             ? `${(waitMs / 3600000).toFixed(1)} 小时`

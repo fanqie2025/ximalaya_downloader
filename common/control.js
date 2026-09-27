@@ -19,8 +19,12 @@ export const state = {
     sleepReason: '',
     // 正在下的那一集：{done, total, pct, title, at}
     current: null,
-    // 上一轮结果：{ok, fail, minutes, at, aborted}
+    // 上一轮结果：{ok, fail, minutes, at, aborted, downloaded}
     lastRound: null,
+    // 退避状态：{stage, consecutiveFailures, maxRetries, retryMinutes, backoffAt}
+    // stage: normal（正常周期）| short-retry（短试中）| backoff（已退避到次日）
+    // 放这儿是为了让网页面板直接读得到，不用 ssh 去翻日志。
+    sched: null,
     logTail: [],
 }
 

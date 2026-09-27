@@ -227,6 +227,7 @@ function buildState() {
         sleepReason: state.sleepReason,
         current: state.current,
         lastRound: state.lastRound,
+        sched: state.sched,
         albums: list,
         orphans,
         summary: {
@@ -582,6 +583,7 @@ function render(st){
   $('sum-hint').textContent = '共 ' + st.summary.total + ' 集，已完成 ' + st.summary.done
     + '（' + st.summary.percent + '%）'
     + (st.lastRound ? '　·　上轮：成功 ' + st.lastRound.ok + ' / 失败 ' + st.lastRound.fail
+        + '，新增 ' + (st.lastRound.downloaded == null ? '?' : st.lastRound.downloaded) + ' 集'
         + '，耗时 ' + st.lastRound.minutes + ' 分钟' : '')
 
   $('btn-pause').disabled = paused || busy
