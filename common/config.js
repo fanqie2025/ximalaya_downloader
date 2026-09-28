@@ -52,6 +52,8 @@ const ENV_MAP = {
   XMD_SCHEDULE_RUN_ON_START: ['schedule', 'runOnStart'],
   XMD_SCHEDULE_RETRY_MINUTES: ['schedule', 'retryMinutes'],
   XMD_SCHEDULE_MAX_RETRIES: ['schedule', 'maxRetries'],
+  // 本轮有新增集数、但最后被挡（撞的是单轮上限）之后多久再来，默认 60 分钟；off/0 关掉。
+  XMD_SCHEDULE_PROGRESS_RETRY_MINUTES: ['schedule', 'progressRetryMinutes'],
   // 短试用尽后退避到次日哪个时刻（"HH:MM"，默认 00:05）。
   // 注意 coerce() 会把纯数字字符串转成 number，所以 scheduler 里取用时统一 String() 一遍。
   XMD_SCHEDULE_BACKOFF_AT: ['schedule', 'backoffAt'],

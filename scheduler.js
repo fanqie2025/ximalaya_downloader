@@ -276,7 +276,21 @@ async function main() {
     // 短试次数上限。**2026-09-27 起语义变了**：以前是「总重试次数」（曾设 24 = 12 小时），
     // 现在是「短试次数」，超限后不再空转，交给下面的 backoffAt 退避。
     const maxRetries = Number(sched.maxRetries) > 0 ? Number(sched.maxRetries) : 6
-    // 短试用完还没起来 —— 大概率是撞了**自然日额度**（实测：约 1000 集/日，跨整点不恢复，
+    // 2026-09-28 起它只数**一集没捞到**的连续轮次：有新增集数的那一轮走 progressRetryMinutes。
+    // 【2026-09-28 实测补上的一档】喜马拉雅有**两道**上限，旧代码把两道混成了一道：
+    //   ① 单轮上限 ≈ 301 集 —— 撞上后约 1 小时就恢复（9/27 三个整点 burst 各 301 集，
+    //      相隔 34~70 分钟；9/28 两轮独立复现 792→1093、1093→1394，都是正好 301 集）。
+    //   ② 当日上限 ≈ 990 集 —— 这个才要等自然日（9/26=989、9/27=991）。
+    // 所以「本轮下到了东西、最后才被挡」说明额度是有的，只是单轮配额用完，睡一会儿再来就行，
+    // 不该退避到次日：9/28 就是照旧退避，白睡了 21 小时，当天只拿到 602 集。
+    // 取 60 分钟：9/27 实测撞墙后 30 分钟那次仍秒级失败，60 分钟那次拿满 301 集。
+    // 设成 off / 0 关掉，退回旧三段式行为（有新增集数也照样退避）。
+    const rawProgressRetry = sched.progressRetryMinutes
+    const progressRetryMinutes = (rawProgressRetry === undefined || rawProgressRetry === null
+        || /^off$/i.test(String(rawProgressRetry).trim()))
+        ? 0
+        : (Number(rawProgressRetry) > 0 ? Number(rawProgressRetry) : 60)
+    // 短试用完**且一集没捞到** —— 才是真的撞了自然日额度（实测：约 990 集/日，跨整点不恢复，
     // 只有跨过 0 点才回）。这时继续 30 分钟一次地盲试纯属浪费，直接退避到次日这个时刻。
     // 实测 2026-09-27 00:01 唤醒即恢复，所以取 00:05 留几分钟余量。
     // 设成空串 / off 可关掉，退化为原来的「回到 intervalHours 常规周期」。
@@ -295,8 +309,11 @@ async function main() {
     log.info(`并发：${opts.slow ? '慢速模式（串行）' : opts.concurrency}　扫描间隔：${intervalHours} 小时` +
         (opts.dryRun ? '　【试运行，不会真的下载】' : ''))
     log.info(`失败重试：${retryMinutes} 分钟一次 × ${maxRetries} 次`
+        + (progressRetryMinutes
+            ? `；有新增集数但被挡则 ${progressRetryMinutes} 分钟后再来（单轮上限实测约 301 集）`
+            : '')
         + (backoffAt
-            ? `；仍失败则退避到每天 ${backoffAt}（额度按自然日重置）`
+            ? `；一集没捞到才退避到每天 ${backoffAt}（当日上限实测约 990 集，跨整点不恢复）`
             : '，之后回到常规周期'))
 
     // 网页控制台放在凭据校验**之前**启动。凭据没配好时恰恰最需要一个能看状态和
@@ -376,14 +393,26 @@ async function main() {
             break
         }
 
-        // 三段式退避（2026-09-27 重做。之前是「30 分钟盲试 24 次」，实测会白扔一整天）：
-        //   ① 本轮成功          → intervalHours 常规周期
-        //   ② 失败、短试没用完   → retryMinutes 短试（覆盖瞬时 / 小时级风控）
-        //   ③ 失败、短试已用尽   → 退避到次日 backoffAt（撞的是自然日额度，盲试毫无意义）
+        // 四段式退避（2026-09-28 修订。旧三段式把「当日上限」和「单轮上限」混成了一道，
+        // 结果每轮下到 301 集就被当彻底失败、退避到次日，白睡一整天）：
+        //   ① 本轮成功            → intervalHours 常规周期
+        //   ② 失败、但有新增集数   → progressRetryMinutes 后再来（撞的是单轮上限，约 1 小时恢复）
+        //   ③ 失败、一集没捞到     → retryMinutes 短试（覆盖瞬时 / 小时级风控）
+        //   ④ 失败、短试用尽仍 0 集 → 退避到次日 backoffAt（撞的是当日上限，盲试毫无意义）
         let waitMs = intervalHours * 60 * 60 * 1000
         let note = ''
         let stage = 'normal'
-        if (failed > 0 && consecutiveFailures < maxRetries) {
+        // 这一轮到底下到东西没有。runOnce 每轮都会写 state.lastRound，failed > 0 时它必是本轮的数。
+        const gotThisRound = (state.lastRound && Number(state.lastRound.downloaded)) || 0
+        if (failed > 0 && gotThisRound > 0 && progressRetryMinutes > 0) {
+            // 有进展 = 撞的是单轮配额，不是当日额度。**不动 consecutiveFailures**：
+            // 它只数「一集没捞到的连续轮次」，所以这一轮既不加也不清零。
+            // （别在这里清零 —— 清零会让当日额度真耗尽时又从 6 次短试从头数起，白转 3 小时。）
+            stage = 'progress-retry'
+            waitMs = progressRetryMinutes * 60 * 1000
+            note = `【本轮失败，但新增 ${gotThisRound} 集 → 撞的是单轮上限（实测约 301 集），`
+                + `${progressRetryMinutes} 分钟后就恢复，不退避到次日】`
+        } else if (failed > 0 && consecutiveFailures < maxRetries) {
             consecutiveFailures++
             stage = 'short-retry'
             waitMs = retryMinutes * 60 * 1000
@@ -400,10 +429,10 @@ async function main() {
             if (w) {
                 waitMs = w.ms
                 // 把 N 的构成写出来，省得再有人问「为什么是 7 而不是 6」
-                note = `【已连续失败 ${consecutiveFailures} 轮（首轮 + ${maxRetries} 次短试已用尽）→ 退避到 ${w.label}】`
-                    + ` 额度按自然日重置（实测约 1000 集/日，跨整点不恢复）；届时仍失败请查凭据或接口`
+                note = `【已连续 ${consecutiveFailures} 轮一集没捞到（首轮 + ${maxRetries} 次短试已用尽）→ 退避到 ${w.label}】`
+                    + ` 当日上限实测约 990 集、跨整点不恢复；届时仍失败请查凭据或接口`
             } else {
-                note = `【已连续失败 ${consecutiveFailures} 轮，退回常规周期 —— 请查日志确认不是凭据或接口问题】`
+                note = `【已连续 ${consecutiveFailures} 轮一集没捞到，退回常规周期 —— 请查日志确认不是凭据或接口问题】`
                 consecutiveFailures = 0
                 stage = 'normal'
             }
@@ -412,7 +441,7 @@ async function main() {
         }
 
         // 退避状态挂到 state 上，网页面板 / api 直接读得到（不用 ssh 翻日志）
-        state.sched = {stage, consecutiveFailures, maxRetries, retryMinutes, backoffAt}
+        state.sched = {stage, consecutiveFailures, maxRetries, retryMinutes, progressRetryMinutes, backoffAt}
 
         const human = waitMs >= 3600000
             ? `${(waitMs / 3600000).toFixed(1)} 小时`
