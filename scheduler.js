@@ -61,6 +61,10 @@ import {
     remainingFor,
     totalCap,
 } from './common/dailyquota.js'
+// 子进程日志行的解析（2026-09-30 抽出，④ 代码卫生）：什么时候算「下到了一集」、
+// 哪些行只是刷屏、进度和文件名怎么从日志里抠出来 —— 规则都在 common/childlog.js，
+// 附 test/_t_childlog.mjs。这段认错的后果很实在（见下面 roundDownloaded 的注释）。
+import {parseChildLine} from './common/childlog.js'
 
 const PROXY_KEYS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY']
 
@@ -140,10 +144,8 @@ export function parseAccounts(raw) {
     return list.length > 0 ? [...new Set(list)] : ['default']
 }
 
-// 子进程进度行长这样：
-//   (web)下载成功＞＞＞＞＞进度:12.34%(196/1589)---->/downloads/《书名》主播 作者/0001.mp3
-const RE_PROGRESS = /进度:([\d.]+)%\((\d+)\/(\d+)\)/
-const RE_TARGET = /---->(.+)$/
+// 子进程进度行的形状（正则、刷屏行、成功标记）都在 common/childlog.js 里，
+// 这里只拿解析结果，不再自己 match。
 
 /**
  * 接管 xmd.js 的输出。
@@ -170,10 +172,11 @@ function forward(stream) {
 }
 
 function onChildLine(line) {
-    if (line.trim() === '') return
+    const p = parseChildLine(line)
+    if (p.blank) return
     // 「获取章节列中…」是首次拉列表时每集刷一行，只用来推阶段、不进页面日志，
     // 否则 1589 集能把日志面板整个冲掉
-    if (line.includes('获取章节列')) {
+    if (p.chapterList) {
         if (state.phase !== 'planning') {
             state.phase = 'planning'
             pushLog(line)
@@ -181,19 +184,17 @@ function onChildLine(line) {
         return
     }
     pushLog(line)
-    const p = line.match(RE_PROGRESS)
-    if (p) {
-        if (line.includes('下载成功')) {
+    if (p.progress) {
+        if (p.succeeded) {
             roundDownloaded++
             maybeStopAtRoundCap()
         }
         state.phase = 'running'
-        const t = line.match(RE_TARGET)
         state.current = {
-            done: Number(p[2]),
-            total: Number(p[3]),
-            pct: Number(p[1]),
-            title: t ? path.basename(t[1].trim()) : (state.current ? state.current.title : null),
+            done: p.progress.done,
+            total: p.progress.total,
+            pct: p.progress.pct,
+            title: p.target ? path.basename(p.target) : (state.current ? state.current.title : null),
             // 谁在下（v9.1）：面板上「本专辑进度」那一行会带上账号名 ——
             // 换账号顶上之后，一眼能看出进度是哪个账号推进的
             account: currentAccountName,
