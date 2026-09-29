@@ -57,6 +57,53 @@ let currentChild = null
 // 2026-09-27 核查时踩到：`grep '进度:'` 数出 821，真实只有 807。
 let roundDownloaded = 0
 
+/**
+ * 主动避让（2026-09-29，定的方案是：单轮 240 集、每天 4 轮、当日封顶 950 集）。
+ *
+ * 动机：被动撞墙法一天只拿到 602 集（9/28）。因为**单轮上限和当日上限返回的都是
+ * ret:1001「系统繁忙」**，根本没法从错误码区分，只能靠「本轮有没有新增集数」猜，
+ * 而实测单轮那道的产出还在 90~497 之间飘。既然早晚要被挡，不如自己数着下：
+ * 一轮下满 N 集就收工，当天累计够 M 集就睡到明天。
+ */
+// 单轮上限（集）。0 = 不限制。到量后主动 SIGTERM 掐子进程 —— 见 maybeStopAtRoundCap。
+let roundCap = 0
+// 这次掐子进程是**我们自己按上限掐的**，不是被平台挡的。必须区分开：
+// 否则 runOnce 会把正常收工当成失败，白走一轮重试/退避。
+let roundCapped = false
+// 当日累计（只数真正下到的集数）。跨自然日归零。
+let dailyDate = ''
+let dailyCount = 0
+// 落盘挑 logs/ —— 它本来就是挂出来的目录（./logs:/app/logs），重建容器/重新 build
+// 都不会把当天的计数忘掉。忘掉的后果是当天再下一轮 240 集，直接顶到平台的墙上。
+const dailyStateFile = path.join(projectRoot, 'logs', 'daily-state.json')
+
+function localDateStr(d = new Date()) {
+    const p = n => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+function loadDailyState() {
+    try {
+        const j = JSON.parse(fs.readFileSync(dailyStateFile, 'utf-8'))
+        if (j && typeof j.date === 'string' && Number.isFinite(Number(j.count))) {
+            return {date: j.date, count: Number(j.count)}
+        }
+    } catch (e) {
+        // 第一次跑、文件还没生成、或内容坏了：都从「今天 0 集」开始
+    }
+    return {date: localDateStr(), count: 0}
+}
+
+function saveDailyState() {
+    try {
+        fs.mkdirSync(path.dirname(dailyStateFile), {recursive: true})
+        fs.writeFileSync(dailyStateFile, JSON.stringify({date: dailyDate, count: dailyCount}) + '\n')
+    } catch (e) {
+        // 计数落盘失败只影响「重建容器后记不记得」，不该因此打断下载
+        log.warn(`当日计数写盘失败（不影响本轮）：${e.message}`)
+    }
+}
+
 // 子进程进度行长这样：
 //   (web)下载成功＞＞＞＞＞进度:12.34%(196/1589)---->/downloads/《书名》主播 作者/0001.mp3
 const RE_PROGRESS = /进度:([\d.]+)%\((\d+)\/(\d+)\)/
@@ -100,7 +147,10 @@ function onChildLine(line) {
     pushLog(line)
     const p = line.match(RE_PROGRESS)
     if (p) {
-        if (line.includes('下载成功')) roundDownloaded++
+        if (line.includes('下载成功')) {
+            roundDownloaded++
+            maybeStopAtRoundCap()
+        }
         state.phase = 'running'
         const t = line.match(RE_TARGET)
         state.current = {
@@ -110,6 +160,26 @@ function onChildLine(line) {
             title: t ? path.basename(t[1].trim()) : (state.current ? state.current.title : null),
             at: Date.now(),
         }
+    }
+}
+
+/**
+ * 本轮下满就主动停 —— 这是正常收工，不是失败。
+ *
+ * 为什么掐子进程，而不是给 xmd.js 加个 --max：上游压根没这个选项（也不该为了
+ * 调度去改上游下载器）。而 SIGTERM 这条路有现成先例 —— 网页上的「暂停」就是
+ * 这么干的：正在下的那一集进度库里没记上，下一轮会重新下，不会留个半集在那儿。
+ */
+function maybeStopAtRoundCap() {
+    if (roundCap <= 0 || roundCapped || !currentChild) return
+    if (roundDownloaded < roundCap) return
+    roundCapped = true
+    log.info(`本轮已下到 ${roundDownloaded} 集，达到单轮上限 ${roundCap} 集 —— 主动停下，`
+        + `剩下的留到下一个周期（正常收工，不是失败，不触发重试/退避）`)
+    try {
+        currentChild.kill('SIGTERM')
+    } catch (e) {
+        // 掐不掉就算了，这一轮只会多下一点
     }
 }
 
@@ -156,6 +226,8 @@ function runAlbum(albumId, opts) {
 async function runOnce(ids, opts) {
     const begun = Date.now()
     roundDownloaded = 0
+    roundCapped = false
+    roundCap = Number(opts.maxPerRound) > 0 ? Math.floor(Number(opts.maxPerRound)) : 0
     let ok = 0
     let fail = 0
     let aborted = false
@@ -165,6 +237,12 @@ async function runOnce(ids, opts) {
             break
         }
         const code = await runAlbum(id, opts)
+        if (roundCapped) {
+            // 是我们自己按单轮上限掐的：算这一轮成功，而且**不再接着跑后面的专辑** ——
+            // 本轮配额已经下完了，接着跑就失去「主动避让」的意义。
+            ok++
+            break
+        }
         if (code === 0) {
             ok++
         } else if (state.paused) {
@@ -184,12 +262,15 @@ async function runOnce(ids, opts) {
     // 判定阈值**故意不改成「本轮 0 集」**：实测 2026-09-27 那几轮里，跑了 15 分钟、
     // 下了 301 集才被挡的轮次根因同样是额度耗尽，但它们不属于「第一集就被挡」。
     // 那种情况靠上面那个「新增 N 集」区分：一集没捞到才是真的一进去就被挡。
-    const quickFail = fail > 0 && Number(mins) < 1
+    const quickFail = fail > 0 && Number(mins) < 1 && !roundCapped
     log.info(`本轮结束：成功 ${ok} 个，失败 ${fail} 个，新增 ${got} 集，耗时 ${mins} 分钟`
         + `${aborted ? '（被暂停打断）' : ''}`
+        + `${roundCapped ? `　← 达到单轮上限 ${roundCap} 集，主动停下（正常收工，不该退避）` : ''}`
         + `${quickFail ? '　← 秒级失败：第一集就被挡，通常是限流/额度耗尽，不是凭据问题' : ''}`)
-    state.lastRound = {ok, fail, minutes: Number(mins), at: Date.now(), aborted, downloaded: got}
-    return {ok, fail, aborted}
+    state.lastRound = {
+        ok, fail, minutes: Number(mins), at: Date.now(), aborted, downloaded: got, capped: roundCapped,
+    }
+    return {ok, fail, aborted, capped: roundCapped, downloaded: got}
 }
 
 /**
@@ -298,6 +379,12 @@ async function main() {
         ? '00:05'
         : String(sched.backoffAt).trim()
     const backoffAt = /^off$/i.test(rawBackoff) ? '' : rawBackoff
+    // ---- 主动避让（2026-09-29）----
+    // 单轮上限：本轮真正下到这么多集就主动停。默认关（0），在 compose 里显式打开 ——
+    // 这样「同一份镜像在本机和飞牛两处跑」时，行为由部署处决定。
+    const maxPerRound = Number(sched.maxPerRound) > 0 ? Math.floor(Number(sched.maxPerRound)) : 0
+    // 当日上限：当天累计下到这么多集，就睡到次日 backoffAt。默认关（0）。
+    const dailyCap = Number(sched.dailyCap) > 0 ? Math.floor(Number(sched.dailyCap)) : 0
     const albumsFile = sched.albumsFile
         ? path.resolve(projectRoot, sched.albumsFile)
         : path.join(projectRoot, 'albums.txt')
@@ -315,6 +402,9 @@ async function main() {
         + (backoffAt
             ? `；一集没捞到才退避到每天 ${backoffAt}（当日上限实测约 990 集，跨整点不恢复）`
             : '，之后回到常规周期'))
+    log.info(`主动避让：单轮 ${maxPerRound > 0 ? `${maxPerRound} 集` : '不限制'}，`
+        + `当日 ${dailyCap > 0 ? `${dailyCap} 集` : '不限制'}`
+        + `　（平台实测单轮约 301 集 / 当日约 990 集；留出余量主动收工，不和它撞）`)
 
     // 网页控制台放在凭据校验**之前**启动。凭据没配好时恰恰最需要一个能看状态和
     // 日志的页面，而不是让人去翻 docker logs。--once 模式跑完就退，没必要开端口。
@@ -349,6 +439,32 @@ async function main() {
 
     let round = 0
     let consecutiveFailures = 0
+
+    // 退避/避让状态挂到 state 上，网页面板 / api 直接读得到（不用 ssh 翻日志）。
+    // 顺手把避让那几个数字也带上，页面上就不用猜「今天还剩多少额度」。
+    function setSched(stage, extra) {
+        state.sched = {
+            stage,
+            consecutiveFailures,
+            maxRetries,
+            retryMinutes,
+            progressRetryMinutes,
+            backoffAt,
+            maxPerRound,
+            dailyCap,
+            dailyCount,
+            ...(extra || {}),
+        }
+    }
+
+    const daily0 = loadDailyState()
+    dailyDate = daily0.date
+    dailyCount = daily0.count
+    if (dailyCap > 0 && dailyCount > 0) {
+        log.info(`续上当天计数：${dailyDate} 已下 ${dailyCount}${dailyCap > 0 ? `/${dailyCap}` : ''} 集`
+            + `（这份计数落在 ${dailyStateFile}，重建容器也不会忘）`)
+    }
+
     while (true) {
         // 暂停检查放在最前面，且**不占轮次编号** —— 否则每被 waitForWake 唤醒一次
         // 轮次就虚增一下，页面上「第 N 轮」会莫名其妙地涨。
@@ -359,6 +475,35 @@ async function main() {
             log.info('已暂停自动下载，在网页上点「继续」即恢复')
             await waitForWake()
             continue
+        }
+
+        // 跨自然日先把当日计数归零 —— 平台那道墙就是按自然日算的（跨整点不恢复）。
+        if (dailyDate !== localDateStr()) {
+            log.info(`跨自然日（${dailyDate} → ${localDateStr()}），当日已下 ${dailyCount} 集计数归零`)
+            dailyDate = localDateStr()
+            dailyCount = 0
+            saveDailyState()
+        }
+        // 当日预算闸门。放在轮次编号**之前**，和暂停一样不占轮次 ——
+        // 它是一次「没跑」的等待，不该让页面上的「第 N 轮」虚涨。
+        if (dailyCap > 0 && dailyCount >= dailyCap) {
+            const w = backoffAt ? msUntilNextDayWindow(backoffAt) : null
+            const capWaitMs = w ? w.ms : intervalHours * 60 * 60 * 1000
+            const capHuman = capWaitMs >= 3600000
+                ? `${(capWaitMs / 3600000).toFixed(1)} 小时`
+                : `${Math.round(capWaitMs / 60000)} 分钟`
+            state.phase = 'idle'
+            state.albumId = null
+            state.current = null
+            setSched('daily-capped')
+            log.info(`今日已下满 ${dailyCount}/${dailyCap} 集（平台当日那道墙实测约 990 集，`
+                + `主动留了余量），休眠 ${capHuman} 后再来`
+                + `${w ? ` —— ${w.label} 之后就是新的一天` : ''}`)
+            const capHit = await sleepInterruptible(
+                capWaitMs, `今日额度已满（${dailyCount}/${dailyCap} 集），休眠 ${capHuman}`)
+            if (!capHit) continue
+            // 被「继续 / 立即跑一轮」打断 = 用户明确要求现在跑，放行这一轮
+            log.info('休眠被手动打断 —— 越过当日上限跑这一轮（单轮上限仍然生效）')
         }
 
         round++
@@ -375,15 +520,31 @@ async function main() {
             log.error(`读订阅列表失败：${e.message}`)
         }
 
-        log.info(`第 ${round} 轮，待处理专辑 ${ids.length} 个：${ids.join(', ') || '(空)'}`)
+        log.info(`第 ${round} 轮，待处理专辑 ${ids.length} 个：${ids.join(', ') || '(空)'}`
+            + (dailyCap > 0 ? `　今日已下 ${dailyCount}/${dailyCap} 集` : ''))
+        // 这一轮最多下多少集：既受单轮上限管，也要给当天剩下的额度留够。
+        // 例：单轮 240、当日 950，前三轮 240×3 = 720，第四轮就只给 230。
+        let roundMax = 0
+        if (dailyCap > 0) roundMax = Math.max(0, dailyCap - dailyCount)
+        if (maxPerRound > 0) roundMax = roundMax > 0 ? Math.min(maxPerRound, roundMax) : maxPerRound
         let failed = 0
+        let gotThisRound = 0
+        let cappedThisRound = false
         if (ids.length > 0) {
-            const result = await runOnce(ids, opts)
+            const result = await runOnce(ids, {...opts, maxPerRound: roundMax})
             if (result.aborted) {
                 // 刚被暂停打断，回到循环顶部进 waitForWake，别去算休眠时长
                 continue
             }
             failed = result.fail
+            gotThisRound = Number(result.downloaded) || 0
+            cappedThisRound = !!result.capped
+            // 只有真跑过一轮才累加当日计数 —— 别去读 state.lastRound，
+            // ids 为空时它还是上一轮的残留值，会把同一批集数数两遍。
+            if (gotThisRound > 0) {
+                dailyCount += gotThisRound
+                saveDailyState()
+            }
         } else {
             log.warn(`订阅列表是空的，往 ${albumsFile} 里一行加一个专辑 ID 或专辑链接即可，无需重启`)
         }
@@ -393,6 +554,8 @@ async function main() {
             break
         }
 
+        // 先判主动避让，再判四段式退避：
+        //   ⓪ 本轮被单轮上限主动停下 → intervalHours 常规周期（正常收工，不是失败）
         // 四段式退避（2026-09-28 修订。旧三段式把「当日上限」和「单轮上限」混成了一道，
         // 结果每轮下到 301 集就被当彻底失败、退避到次日，白睡一整天）：
         //   ① 本轮成功            → intervalHours 常规周期
@@ -402,9 +565,15 @@ async function main() {
         let waitMs = intervalHours * 60 * 60 * 1000
         let note = ''
         let stage = 'normal'
-        // 这一轮到底下到东西没有。runOnce 每轮都会写 state.lastRound，failed > 0 时它必是本轮的数。
-        const gotThisRound = (state.lastRound && Number(state.lastRound.downloaded)) || 0
-        if (failed > 0 && gotThisRound > 0 && progressRetryMinutes > 0) {
+        if (cappedThisRound) {
+            // 主动避让的正常收工：本轮的配额下完了。**算成功** —— consecutiveFailures
+            // 归零（这一轮确实下到了东西，不是被风控），也不走任何重试分支。
+            consecutiveFailures = 0
+            stage = 'round-capped'
+            note = `【本轮下到 ${gotThisRound} 集，达到单轮上限 ${roundMax} 集，主动停下（正常收工）`
+                + `；今日累计 ${dailyCount}${dailyCap > 0 ? `/${dailyCap}` : ''} 集，`
+                + `${intervalHours} 小时后下一轮】`
+        } else if (failed > 0 && gotThisRound > 0 && progressRetryMinutes > 0) {
             // 有进展 = 撞的是单轮配额，不是当日额度。**不动 consecutiveFailures**：
             // 它只数「一集没捞到的连续轮次」，所以这一轮既不加也不清零。
             // （别在这里清零 —— 清零会让当日额度真耗尽时又从 6 次短试从头数起，白转 3 小时。）
@@ -440,8 +609,7 @@ async function main() {
             consecutiveFailures = 0
         }
 
-        // 退避状态挂到 state 上，网页面板 / api 直接读得到（不用 ssh 翻日志）
-        state.sched = {stage, consecutiveFailures, maxRetries, retryMinutes, progressRetryMinutes, backoffAt}
+        setSched(stage)
 
         const human = waitMs >= 3600000
             ? `${(waitMs / 3600000).toFixed(1)} 小时`

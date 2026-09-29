@@ -57,6 +57,10 @@ const ENV_MAP = {
   // 短试用尽后退避到次日哪个时刻（"HH:MM"，默认 00:05）。
   // 注意 coerce() 会把纯数字字符串转成 number，所以 scheduler 里取用时统一 String() 一遍。
   XMD_SCHEDULE_BACKOFF_AT: ['schedule', 'backoffAt'],
+  // 主动避让（2026-09-29）：单轮下满这么多集就主动停（**算成功**，不退避）；
+  // 当天累计下满 dailyCap 集就睡到次日 backoffAt。都是 0 / off 关掉，退回「撞墙才收手」。
+  XMD_SCHEDULE_MAX_PER_ROUND: ['schedule', 'maxPerRound'],
+  XMD_SCHEDULE_DAILY_CAP: ['schedule', 'dailyCap'],
   // DNS 兜底相关，见 common/dnsfix.js
   XMD_DNS_ENABLED: ['dns', 'enabled'],
   XMD_DNS_SERVERS: ['dns', 'servers'],

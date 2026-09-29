@@ -43,7 +43,11 @@ services:
       XMD_ARCHIVES: /downloads
       XMD_WEB_PORT: "8787"
       XMD_SCHEDULE_ALBUMS_FILE: config/albums.txt
-      XMD_SCHEDULE_INTERVAL_HOURS: "12"
+      # 常规周期。2026-09-29 从 12 小时改成 6 小时：配合下面的主动避让，
+      # 一天正好 4 轮 × 240 集 ≈ 950 集。
+      # 注意不是「每 6 小时整点跑」，而是「每轮结束后睡 6 小时」；当天额度下满时会
+      # 提前睡到次日 00:05，所以这点偏移每天都会被重新对齐一次，不会越漂越远。
+      XMD_SCHEDULE_INTERVAL_HOURS: "6"
       # 无人值守建议压低并发，别被平台风控
       XMD_SCHEDULE_CONCURRENCY: "3"
       # 慢速模式：并发 1，且每集之间随机等 0.5~5 秒。
@@ -74,6 +78,23 @@ services:
       XMD_SCHEDULE_MAX_RETRIES: "6"
       XMD_SCHEDULE_PROGRESS_RETRY_MINUTES: "60"
       XMD_SCHEDULE_BACKOFF_AT: "00:05"
+      # ---- 主动避让（2026-09-29 起）----
+      # 上面那四段是「撞墙之后怎么办」，这两行是「别去撞墙」。
+      #
+      # 为什么不继续靠撞墙：单轮上限和当日上限返回的都是 ret:1001「系统繁忙」，
+      # 从错误码上根本分不出来，只能靠「本轮有没有新增集数」猜；而单轮那道墙的
+      # 实际产出还在 90~497 之间飘（众数 301）。被动撞一次就白等一小时起步，
+      # 9/28 就是这么白睡了 21 小时、当天只拿到 602 集。
+      #
+      # 数字是按实测的墙留余量倒推的：
+      #   单轮 240 < 实测 301（众数）  —— 下满 240 就主动收工，算正常结束，不退避
+      #   当日 950 < 实测 990         —— 累计到 950 就睡到次日 00:05
+      #   4 轮 × 240 ≈ 950            —— 配 6 小时周期，一天正好四轮
+      # 每轮真正的上限 = min(单轮上限, 当日剩余)，所以第四轮只会下 950-720=230 集，
+      # 一天的总量不会超。当日计数落在 logs/daily-state.json，重建容器也不会忘。
+      # 想退回老的「撞墙才收手」：把这两行删掉或设成 "0"。
+      XMD_SCHEDULE_MAX_PER_ROUND: "240"
+      XMD_SCHEDULE_DAILY_CAP: "950"
       # 占位符：{title} {anchor} {author} {count} {status}
       XMD_NAMING_TEMPLATE: "《{title}》{anchor} {author}"
     volumes:

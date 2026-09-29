@@ -245,6 +245,9 @@ function buildState() {
             slow: sched.slow === true,
             retryMinutes: sched.retryMinutes,
             maxRetries: sched.maxRetries,
+            // 主动避让（2026-09-29）：单轮上限 / 当日上限，页面设置区直接显示
+            maxPerRound: sched.maxPerRound,
+            dailyCap: sched.dailyCap,
         },
     }
 }
