@@ -673,23 +673,63 @@ async function main() {
     // 轮转游标：指向「下一个该出场的账号」。
     let accountIdx = 0
 
+    // ---- 撞墙冷却（v9，2026-09-30）----
+    // 2026-09-29 晚实测：一轮只下了 39 集，两个通道就同时 `ret:1001`
+    //（`所有下载方式都受限了，可以一个小时后后再过来试试哦`）。那时候的做法是睡满
+    // progressRetryMinutes（60 分钟）再回来 —— 但如果被挡的是**这个账号**而不是这条宽带，
+    // 那 60 分钟是白睡的：换另一个账号立刻就能接着下。
+    // 所以撞墙的账号记一个「解冻时间」，下一轮优先换人；全都冷着才睡。
+    // 换的是 cookie/uid，不是公网 IP —— 所以平台到底按账号算还是按 IP 算，
+    // 看切号之后能不能接着下就知道了（日志里会写清是「换账号顶上」还是「都在冷却」）。
+    const accountBlockedUntil = new Map()
+
+    /** 这个账号还剩多少毫秒冷却（不在冷却里就是 0） */
+    function blockedFor(name, now = Date.now()) {
+        const t = accountBlockedUntil.get(name)
+        return t && t > now ? t - now : 0
+    }
+
+    /** 让它冷却多久（撞墙 / 短试用它） */
+    function blockAccount(name, ms) {
+        accountBlockedUntil.set(name, Date.now() + ms)
+    }
+
+    /** 除 except 之外，还有谁「今天有余额、且不在冷却里」—— 撞墙后立刻换它顶上 */
+    function nextAvailableAccount(except) {
+        for (const a of activeAccounts) {
+            if (a === except) continue
+            if (remainingOf(a) <= 0) continue
+            if (blockedFor(a) > 0) continue
+            return a
+        }
+        return null
+    }
+
     /**
      * 这一轮轮到哪个账号。
      *
-     * 从游标往后找第一个「今天还有余额」的 —— 这就是「交替上阵」：N 个账号轮流来，
-     * 每个账号自己的周期仍然是 intervalHours，所以日产量 ×N。
+     * 从游标往后找第一个「今天还有余额、又不在撞墙冷却里」的 —— 这就是「交替上阵」：
+     * N 个账号轮流来，每个账号自己的周期仍然是 intervalHours，所以日产量 ×N。
+     * v9 起多一条「不在冷却里」：刚被平台挡过的账号先别再用（见上面 accountBlockedUntil）。
      *
+     * 都在冷却里就返回**最早解冻**的那个（主循环会按它的剩余冷却时间睡）；
      * 都下满了返回 null（上面那道闸门会先拦住，正常走不到这儿）；只有用户手动点
      * 「立即跑一轮」越过当日上限时才 forced=true，那时挑今天下得最少的那个顶上。
      */
     function pickAccount(forced) {
         for (let i = 0; i < activeAccounts.length; i++) {
             const name = activeAccounts[(accountIdx + i) % activeAccounts.length]
-            if (remainingOf(name) > 0) {
+            if (remainingOf(name) > 0 && blockedFor(name) <= 0) {
                 accountIdx = (accountIdx + i + 1) % activeAccounts.length
                 return name
             }
         }
+        let soonest = null
+        for (const a of activeAccounts) {
+            if (remainingOf(a) <= 0) continue
+            if (soonest == null || blockedFor(a) < blockedFor(soonest)) soonest = a
+        }
+        if (soonest != null) return soonest
         if (!forced) return null
         let best = null
         for (const a of activeAccounts) {
@@ -811,6 +851,11 @@ async function main() {
                 cap: dailyCap,
                 left: dailyCap > 0 ? Math.max(0, dailyCap - countOf(a)) : null,
             })),
+            // 撞墙冷却（v9）：谁刚被平台挡过、还剩多少秒 —— 面板/`/api/state` 看得出
+            // 「现在睡是因为这个账号在冷却，换个账号本来能接着下」。
+            cooldowns: activeAccounts
+                .map(a => ({name: a, seconds: Math.ceil(blockedFor(a) / 1000)}))
+                .filter(x => x.seconds > 0),
             ...(extra || {}),
         }
     }
@@ -924,6 +969,21 @@ async function main() {
             continue
         }
 
+        // 兜底闸（v9）：所有账号都在撞墙冷却里时，pickAccount 会把最早解冻的那个交出来 ——
+        // 那就按它剩余的时间睡一下，别硬撞同一面墙。正常路径下上一轮的失败分支已经睡够了，
+        // 走到这儿说明是「用户手动点了立即跑一轮」之类的越限场景。
+        const cooldownMs = blockedFor(account)
+        if (cooldownMs > 0) {
+            const cdHuman = cooldownMs >= 3600000
+                ? `${(cooldownMs / 3600000).toFixed(1)} 小时`
+                : `${Math.max(1, Math.ceil(cooldownMs / 60000))} 分钟`
+            log.info(`账号 ${account} 还在撞墙冷却里（还剩约 ${cdHuman}），先等着，不硬撞`)
+            state.phase = 'sleeping'
+            setSched('account-cooldown')
+            await sleepInterruptible(cooldownMs, `账号 ${account} 冷却中（还剩 ${cdHuman}）`)
+            continue
+        }
+
         log.info(`第 ${round} 轮（账号 ${account}），待处理专辑 ${ids.length} 个：${ids.join(', ') || '(空)'}`
             + (dailyCap > 0
                 ? `　${account} 今日已下 ${countOf(account)}/${dailyCap} 集`
@@ -932,7 +992,7 @@ async function main() {
                         : '')
                 : ''))
         // 这一轮最多下多少集：既受单轮上限管，也要给**这个账号**当天剩下的额度留够。
-        // 例：单轮 240、当日 950，某个账号前三轮 240×3 = 720，它的第四轮就只给 230。
+        // 例：单轮 200、当日 950，某个账号前四轮 200×4 = 800，它的第五轮就只给 150。
         let roundMax = 0
         if (dailyCap > 0) roundMax = Math.max(0, dailyCap - countOf(account))
         if (maxPerRound > 0) roundMax = roundMax > 0 ? Math.min(maxPerRound, roundMax) : maxPerRound
@@ -1015,17 +1075,36 @@ async function main() {
             // 它只数「一集没捞到的连续轮次」，所以这一轮既不加也不清零。
             // （别在这里清零 —— 清零会让当日额度真耗尽时又从 6 次短试从头数起，白转 3 小时。）
             stage = 'progress-retry'
+            blockAccount(account, progressRetryMinutes * 60 * 1000)
             waitMs = progressRetryMinutes * 60 * 1000
-            note = `【账号 ${account} 本轮失败，但新增 ${gotThisRound} 集 → 撞的是单轮上限（实测约 301 集），`
-                + `${progressRetryMinutes} 分钟后就恢复，不退避到次日】`
+            // v9：还有别的账号能马上顶上就**不睡** —— 立刻开下一轮去撞另一条命。
+            const altP = nextAvailableAccount(account)
+            if (altP != null) {
+                waitMs = 0
+                note = `【账号 ${account} 本轮失败，但新增 ${gotThisRound} 集 → 撞的是单轮上限`
+                    + `（实测约 301 集）；${account} 冷却 ${progressRetryMinutes} 分钟，`
+                    + `立刻换账号 ${altP} 顶上】`
+            } else {
+                note = `【账号 ${account} 本轮失败，但新增 ${gotThisRound} 集 → 撞的是单轮上限（实测约 301 集），`
+                    + `${progressRetryMinutes} 分钟后就恢复，不退避到次日`
+                    + `${activeAccounts.length > 1 ? '；其它账号也在冷却里，只能等' : ''}】`
+            }
         } else if (failed > 0 && consecutiveFailures < maxRetries) {
             consecutiveFailures++
             stage = 'short-retry'
+            blockAccount(account, retryMinutes * 60 * 1000)
             waitMs = retryMinutes * 60 * 1000
             // 措辞说明（2026-09-27 核查后改）：N 记的是**接下来这次**短试的序号，
             // 不是「刚刚失败的是第 N 次」—— 首次失败时也打 1/6，以前写「第 1/6 次短试」
             // 会被误读成「第 1 次重试」，让人以为计数器从 0 起。
-            note = `【账号 ${account} 本轮失败 → 接下来第 ${consecutiveFailures}/${maxRetries} 次短试】`
+            const altS = nextAvailableAccount(account)
+            if (altS != null) {
+                waitMs = 0
+                note = `【账号 ${account} 本轮一集没捞到 → 让 ${account} 冷却 ${retryMinutes} 分钟，`
+                    + `立刻换账号 ${altS} 顶上（换的是 cookie 不是公网 IP，凭据/接口问题照样会失败）】`
+            } else {
+                note = `【账号 ${account} 本轮失败 → 接下来第 ${consecutiveFailures}/${maxRetries} 次短试】`
+            }
         } else if (failed > 0) {
             // 注意 consecutiveFailures **继续累加**，别清零 —— 清零会让它退回去重新短试，
             // 于是每天都要空转 3 小时。只有真的成功了才归零。
@@ -1050,6 +1129,13 @@ async function main() {
         }
 
         setSched(stage)
+
+        // v9：撞墙后换账号顶上的情况 waitMs = 0 —— 不睡，立刻开下一轮（阶段仍是
+        // progress-retry / short-retry，面板上看得出这是「撞墙换号」而不是正常周期）。
+        if (waitMs <= 0) {
+            log.info(`不睡，立刻开始第 ${round + 1} 轮 ${note}`)
+            continue
+        }
 
         const human = waitMs >= 3600000
             ? `${(waitMs / 3600000).toFixed(1)} 小时`
