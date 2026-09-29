@@ -33,6 +33,17 @@ import {
     registerChildKiller,
 } from './common/control.js'
 import {startWebServer} from './web.js'
+// 账号名单 + 健康状态（2026-09-29 v7）：网页和调度器读同一份，见 common/accountstore.js
+import {
+    readAccounts,
+    readStatus,
+    updateStatus,
+    isDisabled,
+    disabledReason,
+    accountDirFor,
+    findCredential,
+    accountsFile,
+} from './common/accountstore.js'
 
 const PROXY_KEYS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY']
 
@@ -345,34 +356,9 @@ function xmdDir() {
     return resolveHome(config.xmd || '~/.xmd')
 }
 
-/**
- * 账号目录。
- *   default → 根 xmd 目录（2026-09-29 之前唯一那份凭据所在，向后兼容、不用搬文件）
- *   其它     → <xmd>/accounts/<名字>
- * 为什么必须分开：喜马拉雅的额度是**按账号**算的，两份 cookie 不能互相覆盖。
- */
-function accountDir(name) {
-    const root = xmdDir()
-    return name === 'default' ? root : path.join(root, 'accounts', name)
-}
-
-/**
- * 找一份可用的登录凭据。
- * @param {string} dir 账号目录（不是根 xmd 目录 —— 多账号下每个账号一份）
- * @returns {string|null} 凭据文件路径，找不到返回 null
- */
-function findCredential(dir) {
-    for (const f of ['www2-cookies.json', 'mac-cookies.json']) {
-        const p = path.join(dir, f)
-        try {
-            const arr = JSON.parse(fs.readFileSync(p, 'utf-8'))
-            if (Array.isArray(arr) && arr.length > 0) return p
-        } catch (e) {
-            // 不存在或不是合法 JSON，看下一个
-        }
-    }
-    return null
-}
+// 账号目录 + 凭据查找现在放在 common/accountstore.js 里（accountDirFor / findCredential）——
+// 网页面板也要用同一套规则，两边各写一份迟早会分叉。规则仍然是：
+//   default → 根 xmd 目录；其它 → <xmd>/accounts/<名字>。
 
 /**
  * 解析订阅列表。一行一个，支持纯 albumId 和专辑链接，`#` 之后当注释。
@@ -471,42 +457,73 @@ async function main() {
     // ---- 多账号（2026-09-29）----
     // 账号目录只管凭据（cookie + 设备指纹）；下载进度库是**全账号共用**的一份，
     // 路径由 dbDirPath() 决定（这里显式传给子进程，见 accountEnv）。
-    const accounts = parseAccounts(sched.accounts)
+    //
+    // 名单优先级（v7，2026-09-29 晚）：config/accounts.txt 优先 —— 网页面板能加能删、
+    // 运行时生效；XMD_SCHEDULE_ACCOUNTS 降级成**初始默认值**（文件不存在时才用它播种）。
     const dbDir = resolveHome(config.dbDir || config.xmd || '~/.xmd')
-    const accountDirs = {}
-    const activeAccounts = []
-    for (const name of accounts) {
-        const dir = accountDir(name)
-        const cred = findCredential(dir)
-        if (cred == null) {
-            // 一个账号没凭据就让整个容器起不来，太吃亏了 —— 尤其「先把配置写好、回头再扫码」
-            // 这个顺序。这里降级成「这个账号不参与轮转」，其它账号照常跑。
-            const hint = name === 'default' ? dir : path.join(xmdDir(), 'accounts', name)
-            log.error(`账号 ${name} 没有登录凭据（找的是 ${dir}），这个账号不参与轮转`)
-            log.error(`  补凭据：在有屏幕的 Windows 上跑　XMD_XMD_DIR=${hint} node login.js`)
-            log.error('  扫完码把那个目录整个拷到宿主机的映射目录里，再点网页上的「立即跑一轮」')
-            continue
+    let accountDirs = {}
+    let activeAccounts = []
+    // 名单/禁用状态变了才打日志，别每轮刷屏
+    let accountSignature = ''
+
+    /**
+     * 重算「这一轮能上场的账号」。
+     *
+     * 每轮都调一次，所以网页上**加账号 / 删账号 / 禁用 / 启用**都不用重启容器 ——
+     * 用户的原话是「万一账号失效能第一时间增加」，重建容器显然不够快。
+     * 只把「有凭据 且 没被禁用」的算进去；被挡下的逐个说明原因，免得用户明明加了
+     * 账号却发现轮不到它。
+     */
+    function refreshAccounts() {
+        const names = readAccounts()
+        const status = readStatus()
+        const dirs = {}
+        const notes = []
+        for (const name of names) {
+            const dir = accountDirFor(name)
+            if (findCredential(dir) == null) {
+                notes.push(`账号 ${name} 没有登录凭据（找的是 ${dir}），不参与轮转`
+                    + ` —— 网页「账号」卡片里点「扫码登录」，或跑 XMD_XMD_DIR=${dir} node login.js`)
+                continue
+            }
+            const rec = status[name]
+            if (isDisabled(rec)) {
+                notes.push(`账号 ${name} 已被禁用（${disabledReason(rec)}），不参与轮转`
+                    + ' —— 网页「账号」卡片里点「启用」即可恢复')
+                continue
+            }
+            dirs[name] = dir
         }
-        accountDirs[name] = dir
-        activeAccounts.push(name)
-        log.info(`账号 ${name}：凭据 ${cred}`
-            + `${name === 'default' ? '　（根目录，老部署不用搬）' : `　目录 ${dir}`}`)
+        accountDirs = dirs
+        activeAccounts = Object.keys(dirs)
+        const sig = names.join(',') + '|' + activeAccounts.join(',') + '|' + notes.join(';')
+        if (sig !== accountSignature) {
+            accountSignature = sig
+            for (const n of notes) log.error(n)
+            log.info(`账号名单（${accountsFile()}）：${names.join('、') || '(空)'}`
+                + `　→ 能上场 ${activeAccounts.length} 个：${activeAccounts.join('、') || '(无)'}`
+                + (activeAccounts.length > 1
+                    ? `　交替上阵：每 ${(intervalHours / activeAccounts.length).toFixed(1)} 小时一轮`
+                        + `（每个账号自己仍是 ${intervalHours} 小时一轮，日产量 ×${activeAccounts.length}）`
+                    : ''))
+        }
+        return activeAccounts.length
     }
+
+    refreshAccounts()
     if (activeAccounts.length === 0) {
-        log.error(`没有任何可用账号（${accounts.join(', ')}），无法在无人值守下登录。`)
-        log.error('服务端没有屏幕，扫码登录走不通。请这样做：')
-        log.error('  1) 在有屏幕的 Windows 上跑一次：node login.js')
-        log.error('  2) 把这个目录整个拷到宿主机的映射目录：C:\\Users\\<你>\\.xmd')
-        log.error('     （多账号：每个账号各扫一次，XMD_XMD_DIR 指向 <xmd>/accounts/<名字>）')
-        log.error('  3) 重启本容器')
-        process.exit(2)
+        // 这里以前是 process.exit(2)。现在不能这么干了：网页面板和调度器是同一个进程，
+        // 退出等于把「加账号 / 扫码登录」的入口一起关掉 —— 而「一个账号都没有」恰恰是
+        // 最需要那个面板的时候。所以改成报错 + 每 5 分钟自动重算，等用户在页面上加。
+        if (once) {
+            log.error('没有任何可用账号（没凭据，或都被禁用了），单次模式直接退出')
+            process.exit(2)
+        }
+        log.error('没有任何可用账号（没凭据，或都被禁用了）。')
+        log.error('  不用重启容器：打开网页控制台的「账号」卡片，加一个账号并点「扫码登录」即可。')
+        log.error('  也可以在有屏幕的 Windows 上跑　XMD_XMD_DIR=<账号目录> node login.js　再把目录拷过来。')
     }
     log.info(`进度库（全账号共用，绝不能各记一份）：${dbDir}`)
-    log.info(`账号：${activeAccounts.length} 个 —— ${activeAccounts.join('、')}`
-        + (activeAccounts.length > 1
-            ? `　交替上阵：每 ${(intervalHours / activeAccounts.length).toFixed(1)} 小时一轮`
-                + `（每个账号自己仍是 ${intervalHours} 小时一轮，日产量 ×${activeAccounts.length}）`
-            : ''))
 
     if (!fs.existsSync(opts.output)) {
         fs.mkdirSync(opts.output, {recursive: true})
@@ -565,6 +582,97 @@ async function main() {
             if (best == null || countOf(a) < countOf(best)) best = a
         }
         return best
+    }
+
+    // ---- 出场前探测（v7，2026-09-29 晚）----
+    // cookie 文件里写的过期时间是 2094 年，但「过期」不是唯一的死法：平台踢下线、
+    // 账号被禁、改密码，都会让一整轮白跑（日志里 401 / 渠道不可用，一集都下不来）。
+    // 所以轮到某个账号之前先探它一次 —— 开场前就知道，比下到一半才发现划算得多。
+    const PROBE_MAX_AGE_MS = 30 * 60 * 1000
+
+    function parseProbeOutput(text) {
+        const lines = String(text).split(/\r?\n/)
+        for (let i = lines.length - 1; i >= 0; i--) {
+            const l = lines[i].trim()
+            if (!l.startsWith('XMD_PROBE_RESULT=')) continue
+            try {
+                return JSON.parse(l.slice('XMD_PROBE_RESULT='.length))
+            } catch (e) {
+                return null
+            }
+        }
+        return null
+    }
+
+    /**
+     * 探一个账号（子进程）。超时 / 没结果返回 null —— 那是「探不动」，不是「账号坏了」，
+     * 调用方不能据此禁用账号，否则一次网络抖动就把好账号关了。
+     */
+    function probeAccount(name, timeoutMs = 120000) {
+        return new Promise(resolve => {
+            let child
+            try {
+                child = spawn(process.execPath, ['probe-account.js', name], {
+                    cwd: projectRoot,
+                    env: childEnv({XMD_XMD_DIR: accountDirs[name], XMD_DB_DIR: dbDir}),
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                })
+            } catch (e) {
+                log.warn(`账号 ${name} 探测进程起不来：${e.message}`)
+                return resolve(null)
+            }
+            let out = ''
+            const onData = chunk => {
+                const s = String(chunk)
+                out += s
+                process.stdout.write(s) // 探测日志也进 docker logs
+            }
+            child.stdout.on('data', onData)
+            child.stderr.on('data', onData)
+            const timer = setTimeout(() => {
+                log.warn(`账号 ${name} 探测超过 ${Math.round(timeoutMs / 1000)} 秒没回，放弃这次探测`
+                    + '（这一轮照常跑，别把网络慢当成账号坏了）')
+                try {
+                    child.kill('SIGKILL')
+                } catch (e) {
+                    // 杀不掉就随它去，它自己会超时退出
+                }
+                resolve(null)
+            }, timeoutMs)
+            child.on('close', () => {
+                clearTimeout(timer)
+                resolve(parseProbeOutput(out))
+            })
+        })
+    }
+
+    /** 30 分钟内探过、且结论是「活」就直接复用 —— 别每点一次「立即跑一轮」都去敲一遍接口 */
+    async function probeAccountIfStale(name) {
+        const rec = readStatus()[name]
+        if (rec && rec.alive === true && rec.at && Date.now() - rec.at < PROBE_MAX_AGE_MS) return rec
+        state.probing = name
+        try {
+            const p = await probeAccount(name)
+            if (p == null) return null
+            const patch = {
+                at: p.at || Date.now(),
+                alive: p.alive === true,
+                reason: p.alive === true ? '' : (p.reason || '探测未通过'),
+                uid: p.uid,
+                nickname: p.nickname,
+                vip: p.vip,
+                vipExpire: p.vipExpire,
+                robot: p.robot,
+                ban: p.ban,
+                channels: p.channels,
+                fingerprint: p.fingerprint,
+            }
+            // 探活了就自动解掉「探测判死」那个禁用；用户手动禁用的那个不动（得他自己点启用）
+            if (patch.alive) patch.autoDisabled = false
+            return updateStatus(name, patch)
+        } finally {
+            state.probing = null
+        }
     }
 
     // 退避/避让状态挂到 state 上，网页面板 / api 直接读得到（不用 ssh 翻日志）。
@@ -662,9 +770,38 @@ async function main() {
             log.error(`读订阅列表失败：${e.message}`)
         }
 
+        // 每轮重算一次账号名单：网页上刚加的账号 / 刚禁用的账号，下一轮就生效，不用重建容器。
+        refreshAccounts()
+
         // 轮到这个账号出场（交替上阵）。放在轮次编号之后，因为它算是「这一轮由谁跑」。
-        const account = pickAccount(forcedThisRound)
+        // 出场前先探一下它还活着没有（见上面 probeAccountIfStale）：
+        //   探死了 → 当场自动禁用，换下一个账号（页面会亮红点，日志里写清原因）
+        //   探不动（超时）→ 照常跑，不能因为网络抖动把好账号关了
+        let account = null
+        for (let attempt = 0; attempt < Math.max(1, activeAccounts.length); attempt++) {
+            const cand = pickAccount(forcedThisRound)
+            if (cand == null) break
+            const p = await probeAccountIfStale(cand)
+            if (p != null && p.alive !== true) {
+                updateStatus(cand, {autoDisabled: true, reason: p.reason || '凭据已失效'})
+                log.error(`账号 ${cand} 探测未通过，自动禁用并换下一个：${p.reason || '凭据已失效'}`)
+                log.error('  在网页「账号」卡片里点「扫码登录」重新扫一次即可恢复（不用重启容器）')
+                refreshAccounts()
+                continue
+            }
+            account = cand
+            break
+        }
         if (account == null) {
+            if (activeAccounts.length === 0) {
+                // 没凭据 / 全被禁用：面板还开着，等用户在页面上加一个或启用一个
+                log.error('当前没有可用账号，5 分钟后再看一次'
+                    + '（在网页「账号」卡片里添加账号并扫码登录，或启用被禁用的账号）')
+                state.phase = 'idle'
+                setSched('no-account')
+                await sleepInterruptible(5 * 60 * 1000, '没有可用账号（等网页上添加 / 启用）')
+                continue
+            }
             // 兜底：上面那道闸门已经拦过一次，正常走不到这儿 —— 除非当日上限在跑的中途被改小
             log.warn('所有账号今天的额度都用完了，等下一个自然日')
             setSched('daily-capped')

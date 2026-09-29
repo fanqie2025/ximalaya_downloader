@@ -87,6 +87,58 @@ async function getXmSign() {
     }
 }
 
+/**
+ * 真校验一份设备指纹（网页面板上那个「真校验」按钮）。
+ *
+ * 本地看 `GJ2` / `fd2.av1` 只能说明「采过、被服务端注册过」，
+ * 但那份快照是不是**现在**还能换来 cadd 才是关键 —— 所以照生产路径真报一次，
+ * 把服务端原话（aid / cadd / err）拿回来，而不是只看字段在不在。
+ *
+ * 与 getXmSign 的区别：这里**不抛异常**（页面要的是结果，不是一个 500），
+ * 而且额外回报用了哪个文件、字段数、UA，方便页面直接显示。
+ */
+async function reportDeviceInfo() {
+    const file = deviceInfoPath()
+    const result = {path: file, exists: false, fields: 0, ua: null, registered: false, aid: '', cadd: '', sid: '', err: null, http: null, error: null}
+    let raw
+    try {
+        raw = JSON.parse(fs.readFileSync(file, 'utf-8'))
+    } catch (e) {
+        result.error = `读不到设备指纹文件（${file}）：${e.message}`
+        return result
+    }
+    result.exists = true
+    result.fields = Object.keys(raw).length
+    // 这两个字段是「当初上报被服务端认了」才会被回填的：形状对但它们是空的 = 没注册过
+    result.registered = Boolean(raw.GJ2) && Boolean(raw.fd2 && raw.fd2.av1)
+    const info = {...raw}
+    for (const key of INTERNAL_KEYS) delete info[key]
+    info.Zf5 = Date.now()
+    const ua = userAgent(info)
+    result.ua = ua
+    const payload = aesEncrypt(zlib.deflateSync(Buffer.from(JSON.stringify(info), 'utf8'), {level: 6}))
+    try {
+        const response = await iaxios.post(REPORT_URL + crypto.randomUUID(), payload, {
+            headers: {
+                'Content-Type': 'application/octet-stream',
+                'User-Agent': ua
+            }
+        })
+        result.http = response.status
+        const body = JSON.parse(aesDecrypt(Buffer.from(String(response.data), 'base64')))
+        result.aid = body.aid || ''
+        result.cadd = body.cadd || ''
+        result.sid = body.sid || ''
+        result.err = body.err
+        // 服务端 err 永远是 "0"（它只收不认），认没认过全看 aid / cadd 给没给
+        result.accepted = Boolean(result.aid && result.cadd)
+    } catch (e) {
+        result.error = e.message
+    }
+    return result
+}
+
 export {
-    getXmSign
+    getXmSign,
+    reportDeviceInfo
 }

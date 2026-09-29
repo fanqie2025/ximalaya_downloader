@@ -65,6 +65,9 @@ settings.local.json
 config/albums.txt
 config/albums.meta.json
 
+# --- 账号名单（v7）：由网页面板的「账号」卡片维护，仓库里不带真实账号名 ---
+config/accounts.txt
+
 # --- 体积：node/ 100M、下载/ 154M、exe 12M，进 git 只会把仓库撑爆 ---
 node/
 下载/

@@ -70,6 +70,9 @@ const ENV_MAP = {
   //   default = 根 xmd 目录（老凭据不用搬）；其它名字 = <xmd>/accounts/<名字>/。
   // 不配就是单账号，行为和以前完全一样。上面那两个上限是**按账号各算一份**的。
   XMD_SCHEDULE_ACCOUNTS: ['schedule', 'accounts'],
+  // 账号名单文件（2026-09-29 v7）：网页面板能加能删，运行时生效，不用重建容器。
+  // 不配就是 config/accounts.txt；文件不存在时用上面那个 XMD_SCHEDULE_ACCOUNTS 播种。
+  XMD_SCHEDULE_ACCOUNTS_FILE: ['schedule', 'accountsFile'],
   // DNS 兜底相关，见 common/dnsfix.js
   XMD_DNS_ENABLED: ['dns', 'enabled'],
   XMD_DNS_SERVERS: ['dns', 'servers'],

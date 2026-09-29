@@ -25,6 +25,8 @@ export const state = {
     // stage: normal（正常周期）| short-retry（短试中）| backoff（已退避到次日）
     // 放这儿是为了让网页面板直接读得到，不用 ssh 去翻日志。
     sched: null,
+    // 正在探测的账号名（出场前验凭据，见 scheduler.js probeAccountIfStale）—— 页面拿它显示「探测中…」
+    probing: null,
     logTail: [],
 }
 
