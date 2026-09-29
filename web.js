@@ -19,7 +19,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {fileURLToPath} from 'node:url'
-import {config} from './common/config.js'
+import {config, dbDirPath} from './common/config.js'
 import {projectRoot} from './settings.js'
 import {log} from './common/log4jscf.js'
 import {state, wake, killCurrent} from './common/control.js'
@@ -157,9 +157,11 @@ function removeSub(id) {
     return {ok: true}
 }
 
-/** 每个订阅的进度：总数 / 已完成 / 标题 / 主播，全从进度库推 */
+/** 每个订阅的进度：总数 / 已完成 / 标题 / 主播，全从进度库推。
+ *  注意进度库走 dbDirPath()（全账号共用那份），**不是** xmdDir() —— 多账号下
+ *  xmdDir() 只是某个账号的凭据目录，里面没有 track.db。 */
 function collectAlbums() {
-    const base = path.join(xmdDir(), 'db', 'file')
+    const base = path.join(dbDirPath(), 'db', 'file')
     const tracks = readNedb(path.join(base, 'track.db'))
     const albumDocs = readNedb(path.join(base, 'album.db'))
 
@@ -248,6 +250,9 @@ function buildState() {
             // 主动避让（2026-09-29）：单轮上限 / 当日上限，页面设置区直接显示
             maxPerRound: sched.maxPerRound,
             dailyCap: sched.dailyCap,
+            // 多账号（2026-09-29）：账号列表 + 共用的进度库目录。两个上限是**按账号各算一份**的。
+            accounts: sched.accounts,
+            dbDir: config.dbDir || null,
         },
     }
 }

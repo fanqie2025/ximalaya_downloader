@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import {config} from './common/config.js'
+import {config, dbDirPath} from './common/config.js'
 import pLimit from 'p-limit';
 import {log} from './common/log4jscf.js'
 import {trackDB} from './db/trackdb.js'
@@ -167,7 +167,9 @@ async function main() {
     }
     if (options.replace) {
         log.info("清空缓存中...")
-        rimrafSync(path.join(config.xmd.replace('~', os.homedir()), 'db', 'file'))
+        // 清的是**共用**的进度库目录（dbDirPath），不是某个账号的凭据目录 ——
+        // 多账号下 XMD_XMD_DIR 指向的是账号目录，那里没有 db。
+        rimrafSync(path.join(dbDirPath(), 'db', 'file'))
     }
     log.info(`当前albumId:${options.albumId}`)
     log.info(`当前保存目录:${options.output}`)

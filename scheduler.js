@@ -43,9 +43,15 @@ const PROXY_KEYS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'a
  * 明文发到 443，服务端回 "The plain http request was sent to https port"，
  * 表现成莫名其妙的 400。容器里一般没代理，但这个变量从宿主机漏进来就麻烦了。
  */
-function childEnv() {
+function childEnv(extra) {
     const env = {...process.env}
     for (const k of PROXY_KEYS) delete env[k]
+    // 多账号（2026-09-29）：这两个是**每次 spawn 现算**的，不是写死在 compose 里的容器级
+    // 环境变量，因为每个账号不一样：
+    //   XMD_XMD_DIR → 这个账号自己的目录（cookie 与设备指纹都在里面）
+    //   XMD_DB_DIR  → 全账号**共用**的进度库（track.db / album.db）
+    // 进度库绝不能跟着账号走：它是「这集下过没有」的唯一依据，各记一份就会重复下。
+    if (extra) Object.assign(env, extra)
     return env
 }
 
@@ -71,8 +77,10 @@ let roundCap = 0
 // 否则 runOnce 会把正常收工当成失败，白走一轮重试/退避。
 let roundCapped = false
 // 当日累计（只数真正下到的集数）。跨自然日归零。
+// **按账号分开记**（2026-09-29 多账号）：平台那道当日墙是按账号算的，
+// 「这个账号今天还剩多少」自然也要各算各的。
 let dailyDate = ''
-let dailyCount = 0
+let dailyCounts = {}   // {账号名: 今天已下的集数}
 // 落盘挑 logs/ —— 它本来就是挂出来的目录（./logs:/app/logs），重建容器/重新 build
 // 都不会把当天的计数忘掉。忘掉的后果是当天再下一轮 240 集，直接顶到平台的墙上。
 const dailyStateFile = path.join(projectRoot, 'logs', 'daily-state.json')
@@ -85,23 +93,48 @@ function localDateStr(d = new Date()) {
 function loadDailyState() {
     try {
         const j = JSON.parse(fs.readFileSync(dailyStateFile, 'utf-8'))
-        if (j && typeof j.date === 'string' && Number.isFinite(Number(j.count))) {
-            return {date: j.date, count: Number(j.count)}
+        if (j && typeof j.date === 'string') {
+            // 新格式：{date, accounts:{账号: 集数}}
+            if (j.accounts && typeof j.accounts === 'object' && !Array.isArray(j.accounts)) {
+                const counts = {}
+                for (const [k, v] of Object.entries(j.accounts)) {
+                    if (Number.isFinite(Number(v))) counts[k] = Number(v)
+                }
+                return {date: j.date, counts}
+            }
+            // 旧格式（v5 单账号）：{date, count} —— 那份计数就是 default 账号的
+            if (Number.isFinite(Number(j.count))) {
+                return {date: j.date, counts: {default: Number(j.count)}}
+            }
         }
     } catch (e) {
         // 第一次跑、文件还没生成、或内容坏了：都从「今天 0 集」开始
     }
-    return {date: localDateStr(), count: 0}
+    return {date: localDateStr(), counts: {}}
 }
 
 function saveDailyState() {
     try {
         fs.mkdirSync(path.dirname(dailyStateFile), {recursive: true})
-        fs.writeFileSync(dailyStateFile, JSON.stringify({date: dailyDate, count: dailyCount}) + '\n')
+        fs.writeFileSync(dailyStateFile, JSON.stringify({date: dailyDate, accounts: dailyCounts}) + '\n')
     } catch (e) {
         // 计数落盘失败只影响「重建容器后记不记得」，不该因此打断下载
         log.warn(`当日计数写盘失败（不影响本轮）：${e.message}`)
     }
+}
+
+/**
+ * 账号名单：逗号分隔（如 "default,bob"）。空 = 单账号，也就是 2026-09-29 之前的行为。
+ *
+ * `default` 这个名字是**保留**的：它指根 xmd 目录 —— 老部署那份唯一的凭据就在那儿，
+ * 所以「加第二个账号」不需要搬动任何现有文件。其它名字都落在 <xmd>/accounts/<名字>/。
+ */
+export function parseAccounts(raw) {
+    const list = String(raw == null ? '' : raw)
+        .split(',')
+        .map(s => s.trim())
+        .filter(s => s !== '')
+    return list.length > 0 ? [...new Set(list)] : ['default']
 }
 
 // 子进程进度行长这样：
@@ -195,7 +228,7 @@ function runAlbum(albumId, opts) {
         log.info(`${'='.repeat(12)} 开始处理专辑 ${albumId} ${'='.repeat(12)}`)
         const child = spawn(process.execPath, args, {
             cwd: projectRoot,
-            env: childEnv(),
+            env: childEnv(opts.accountEnv),
             stdio: ['ignore', 'pipe', 'pipe'],
         })
         currentChild = child
@@ -264,11 +297,13 @@ async function runOnce(ids, opts) {
     // 那种情况靠上面那个「新增 N 集」区分：一集没捞到才是真的一进去就被挡。
     const quickFail = fail > 0 && Number(mins) < 1 && !roundCapped
     log.info(`本轮结束：成功 ${ok} 个，失败 ${fail} 个，新增 ${got} 集，耗时 ${mins} 分钟`
+        + `${opts.account ? `（账号 ${opts.account}）` : ''}`
         + `${aborted ? '（被暂停打断）' : ''}`
         + `${roundCapped ? `　← 达到单轮上限 ${roundCap} 集，主动停下（正常收工，不该退避）` : ''}`
         + `${quickFail ? '　← 秒级失败：第一集就被挡，通常是限流/额度耗尽，不是凭据问题' : ''}`)
     state.lastRound = {
         ok, fail, minutes: Number(mins), at: Date.now(), aborted, downloaded: got, capped: roundCapped,
+        account: opts.account || null,
     }
     return {ok, fail, aborted, capped: roundCapped, downloaded: got}
 }
@@ -311,11 +346,22 @@ function xmdDir() {
 }
 
 /**
+ * 账号目录。
+ *   default → 根 xmd 目录（2026-09-29 之前唯一那份凭据所在，向后兼容、不用搬文件）
+ *   其它     → <xmd>/accounts/<名字>
+ * 为什么必须分开：喜马拉雅的额度是**按账号**算的，两份 cookie 不能互相覆盖。
+ */
+function accountDir(name) {
+    const root = xmdDir()
+    return name === 'default' ? root : path.join(root, 'accounts', name)
+}
+
+/**
  * 找一份可用的登录凭据。
+ * @param {string} dir 账号目录（不是根 xmd 目录 —— 多账号下每个账号一份）
  * @returns {string|null} 凭据文件路径，找不到返回 null
  */
-function findCredential() {
-    const dir = xmdDir()
+function findCredential(dir) {
     for (const f of ['www2-cookies.json', 'mac-cookies.json']) {
         const p = path.join(dir, f)
         try {
@@ -422,16 +468,45 @@ async function main() {
         startWebServer()
     }
 
-    const cred = findCredential()
-    if (cred == null) {
-        log.error(`没有找到登录凭据（找的是 ${xmdDir()}），无法在无人值守下登录。`)
+    // ---- 多账号（2026-09-29）----
+    // 账号目录只管凭据（cookie + 设备指纹）；下载进度库是**全账号共用**的一份，
+    // 路径由 dbDirPath() 决定（这里显式传给子进程，见 accountEnv）。
+    const accounts = parseAccounts(sched.accounts)
+    const dbDir = resolveHome(config.dbDir || config.xmd || '~/.xmd')
+    const accountDirs = {}
+    const activeAccounts = []
+    for (const name of accounts) {
+        const dir = accountDir(name)
+        const cred = findCredential(dir)
+        if (cred == null) {
+            // 一个账号没凭据就让整个容器起不来，太吃亏了 —— 尤其「先把配置写好、回头再扫码」
+            // 这个顺序。这里降级成「这个账号不参与轮转」，其它账号照常跑。
+            const hint = name === 'default' ? dir : path.join(xmdDir(), 'accounts', name)
+            log.error(`账号 ${name} 没有登录凭据（找的是 ${dir}），这个账号不参与轮转`)
+            log.error(`  补凭据：在有屏幕的 Windows 上跑　XMD_XMD_DIR=${hint} node login.js`)
+            log.error('  扫完码把那个目录整个拷到宿主机的映射目录里，再点网页上的「立即跑一轮」')
+            continue
+        }
+        accountDirs[name] = dir
+        activeAccounts.push(name)
+        log.info(`账号 ${name}：凭据 ${cred}`
+            + `${name === 'default' ? '　（根目录，老部署不用搬）' : `　目录 ${dir}`}`)
+    }
+    if (activeAccounts.length === 0) {
+        log.error(`没有任何可用账号（${accounts.join(', ')}），无法在无人值守下登录。`)
         log.error('服务端没有屏幕，扫码登录走不通。请这样做：')
         log.error('  1) 在有屏幕的 Windows 上跑一次：node login.js')
         log.error('  2) 把这个目录整个拷到宿主机的映射目录：C:\\Users\\<你>\\.xmd')
+        log.error('     （多账号：每个账号各扫一次，XMD_XMD_DIR 指向 <xmd>/accounts/<名字>）')
         log.error('  3) 重启本容器')
         process.exit(2)
     }
-    log.info(`登录凭据：${cred}`)
+    log.info(`进度库（全账号共用，绝不能各记一份）：${dbDir}`)
+    log.info(`账号：${activeAccounts.length} 个 —— ${activeAccounts.join('、')}`
+        + (activeAccounts.length > 1
+            ? `　交替上阵：每 ${(intervalHours / activeAccounts.length).toFixed(1)} 小时一轮`
+                + `（每个账号自己仍是 ${intervalHours} 小时一轮，日产量 ×${activeAccounts.length}）`
+            : ''))
 
     if (!fs.existsSync(opts.output)) {
         fs.mkdirSync(opts.output, {recursive: true})
@@ -439,6 +514,58 @@ async function main() {
 
     let round = 0
     let consecutiveFailures = 0
+
+    // ---- 当日预算：按账号各算各的 ----
+    function countOf(name) {
+        return Number(dailyCounts[name]) || 0
+    }
+
+    function totalDaily() {
+        let n = 0
+        for (const a of activeAccounts) n += countOf(a)
+        return n
+    }
+
+    function fmtCounts() {
+        const parts = Object.entries(dailyCounts)
+            .filter(([, v]) => Number(v) > 0)
+            .map(([k, v]) => `${k} ${v} 集`)
+        return parts.length > 0 ? parts.join('，') : '0 集'
+    }
+
+    /** 这个账号今天还能下多少集；没配当日上限就是无限 */
+    function remainingOf(name) {
+        if (dailyCap <= 0) return Infinity
+        return Math.max(0, dailyCap - countOf(name))
+    }
+
+    // 轮转游标：指向「下一个该出场的账号」。
+    let accountIdx = 0
+
+    /**
+     * 这一轮轮到哪个账号。
+     *
+     * 从游标往后找第一个「今天还有余额」的 —— 这就是「交替上阵」：N 个账号轮流来，
+     * 每个账号自己的周期仍然是 intervalHours，所以日产量 ×N。
+     *
+     * 都下满了返回 null（上面那道闸门会先拦住，正常走不到这儿）；只有用户手动点
+     * 「立即跑一轮」越过当日上限时才 forced=true，那时挑今天下得最少的那个顶上。
+     */
+    function pickAccount(forced) {
+        for (let i = 0; i < activeAccounts.length; i++) {
+            const name = activeAccounts[(accountIdx + i) % activeAccounts.length]
+            if (remainingOf(name) > 0) {
+                accountIdx = (accountIdx + i + 1) % activeAccounts.length
+                return name
+            }
+        }
+        if (!forced) return null
+        let best = null
+        for (const a of activeAccounts) {
+            if (best == null || countOf(a) < countOf(best)) best = a
+        }
+        return best
+    }
 
     // 退避/避让状态挂到 state 上，网页面板 / api 直接读得到（不用 ssh 翻日志）。
     // 顺手把避让那几个数字也带上，页面上就不用猜「今天还剩多少额度」。
@@ -452,16 +579,26 @@ async function main() {
             backoffAt,
             maxPerRound,
             dailyCap,
-            dailyCount,
+            // 面板的老字段，含义保持「今天一共下了多少集」：多账号下就是各账号之和
+            dailyCount: totalDaily(),
+            dailyCounts: {...dailyCounts},
+            accounts: activeAccounts.map(a => ({
+                name: a,
+                dir: accountDirs[a],
+                count: countOf(a),
+                cap: dailyCap,
+                left: dailyCap > 0 ? Math.max(0, dailyCap - countOf(a)) : null,
+            })),
             ...(extra || {}),
         }
     }
 
     const daily0 = loadDailyState()
     dailyDate = daily0.date
-    dailyCount = daily0.count
-    if (dailyCap > 0 && dailyCount > 0) {
-        log.info(`续上当天计数：${dailyDate} 已下 ${dailyCount}${dailyCap > 0 ? `/${dailyCap}` : ''} 集`
+    dailyCounts = daily0.counts
+    if (dailyCap > 0 && totalDaily() > 0) {
+        log.info(`续上当天计数（${dailyDate}）：${fmtCounts()}`
+            + `　每个账号上限 ${dailyCap} 集`
             + `（这份计数落在 ${dailyStateFile}，重建容器也不会忘）`)
     }
 
@@ -477,16 +614,18 @@ async function main() {
             continue
         }
 
+        let forcedThisRound = false
         // 跨自然日先把当日计数归零 —— 平台那道墙就是按自然日算的（跨整点不恢复）。
         if (dailyDate !== localDateStr()) {
-            log.info(`跨自然日（${dailyDate} → ${localDateStr()}），当日已下 ${dailyCount} 集计数归零`)
+            log.info(`跨自然日（${dailyDate} → ${localDateStr()}），各账号当日计数归零`
+                + `（昨天合计 ${totalDaily()} 集：${fmtCounts()}）`)
             dailyDate = localDateStr()
-            dailyCount = 0
+            dailyCounts = {}
             saveDailyState()
         }
-        // 当日预算闸门。放在轮次编号**之前**，和暂停一样不占轮次 ——
-        // 它是一次「没跑」的等待，不该让页面上的「第 N 轮」虚涨。
-        if (dailyCap > 0 && dailyCount >= dailyCap) {
+        // 当日预算闸门：**所有账号**都下满才睡到次日。放在轮次编号**之前**，和暂停一样
+        // 不占轮次 —— 它是一次「没跑」的等待，不该让页面上的「第 N 轮」虚涨。
+        if (dailyCap > 0 && activeAccounts.every(a => remainingOf(a) <= 0)) {
             const w = backoffAt ? msUntilNextDayWindow(backoffAt) : null
             const capWaitMs = w ? w.ms : intervalHours * 60 * 60 * 1000
             const capHuman = capWaitMs >= 3600000
@@ -496,14 +635,17 @@ async function main() {
             state.albumId = null
             state.current = null
             setSched('daily-capped')
-            log.info(`今日已下满 ${dailyCount}/${dailyCap} 集（平台当日那道墙实测约 990 集，`
-                + `主动留了余量），休眠 ${capHuman} 后再来`
+            log.info(`今日已下满（每个账号 ${dailyCap} 集封顶 × ${activeAccounts.length} 个账号，`
+                + `合计 ${totalDaily()} 集；平台当日那道墙实测约 990 集/账号，主动留了余量），`
+                + `休眠 ${capHuman} 后再来`
                 + `${w ? ` —— ${w.label} 之后就是新的一天` : ''}`)
             const capHit = await sleepInterruptible(
-                capWaitMs, `今日额度已满（${dailyCount}/${dailyCap} 集），休眠 ${capHuman}`)
+                capWaitMs,
+                `今日额度已满（合计 ${totalDaily()}/${dailyCap * activeAccounts.length} 集），休眠 ${capHuman}`)
             if (!capHit) continue
             // 被「继续 / 立即跑一轮」打断 = 用户明确要求现在跑，放行这一轮
             log.info('休眠被手动打断 —— 越过当日上限跑这一轮（单轮上限仍然生效）')
+            forcedThisRound = true
         }
 
         round++
@@ -520,18 +662,39 @@ async function main() {
             log.error(`读订阅列表失败：${e.message}`)
         }
 
-        log.info(`第 ${round} 轮，待处理专辑 ${ids.length} 个：${ids.join(', ') || '(空)'}`
-            + (dailyCap > 0 ? `　今日已下 ${dailyCount}/${dailyCap} 集` : ''))
-        // 这一轮最多下多少集：既受单轮上限管，也要给当天剩下的额度留够。
-        // 例：单轮 240、当日 950，前三轮 240×3 = 720，第四轮就只给 230。
+        // 轮到这个账号出场（交替上阵）。放在轮次编号之后，因为它算是「这一轮由谁跑」。
+        const account = pickAccount(forcedThisRound)
+        if (account == null) {
+            // 兜底：上面那道闸门已经拦过一次，正常走不到这儿 —— 除非当日上限在跑的中途被改小
+            log.warn('所有账号今天的额度都用完了，等下一个自然日')
+            setSched('daily-capped')
+            const w = backoffAt ? msUntilNextDayWindow(backoffAt) : null
+            await sleepInterruptible(w ? w.ms : intervalHours * 60 * 60 * 1000, '今日额度已满')
+            continue
+        }
+
+        log.info(`第 ${round} 轮（账号 ${account}），待处理专辑 ${ids.length} 个：${ids.join(', ') || '(空)'}`
+            + (dailyCap > 0
+                ? `　${account} 今日已下 ${countOf(account)}/${dailyCap} 集`
+                    + (activeAccounts.length > 1
+                        ? `（全部账号合计 ${totalDaily()}/${dailyCap * activeAccounts.length}）`
+                        : '')
+                : ''))
+        // 这一轮最多下多少集：既受单轮上限管，也要给**这个账号**当天剩下的额度留够。
+        // 例：单轮 240、当日 950，某个账号前三轮 240×3 = 720，它的第四轮就只给 230。
         let roundMax = 0
-        if (dailyCap > 0) roundMax = Math.max(0, dailyCap - dailyCount)
+        if (dailyCap > 0) roundMax = Math.max(0, dailyCap - countOf(account))
         if (maxPerRound > 0) roundMax = roundMax > 0 ? Math.min(maxPerRound, roundMax) : maxPerRound
+        // 手动越限那一轮里所有账号都已下满，上面算出来是 0 —— 那不代表「不下」，
+        // 而是「用户偏要跑」，所以退回单轮上限。（dailyCap 关掉时本来就不会是 0）
+        if (roundMax <= 0 && maxPerRound > 0) roundMax = maxPerRound
+        // 账号目录 + 共用的进度库，跟着这次 spawn 传下去 —— 多账号能跑起来全靠这两个变量
+        const accountEnv = {XMD_XMD_DIR: accountDirs[account], XMD_DB_DIR: dbDir}
         let failed = 0
         let gotThisRound = 0
         let cappedThisRound = false
         if (ids.length > 0) {
-            const result = await runOnce(ids, {...opts, maxPerRound: roundMax})
+            const result = await runOnce(ids, {...opts, maxPerRound: roundMax, account, accountEnv})
             if (result.aborted) {
                 // 刚被暂停打断，回到循环顶部进 waitForWake，别去算休眠时长
                 continue
@@ -542,7 +705,7 @@ async function main() {
             // 只有真跑过一轮才累加当日计数 —— 别去读 state.lastRound，
             // ids 为空时它还是上一轮的残留值，会把同一批集数数两遍。
             if (gotThisRound > 0) {
-                dailyCount += gotThisRound
+                dailyCounts[account] = countOf(account) + gotThisRound
                 saveDailyState()
             }
         } else {
@@ -555,14 +718,27 @@ async function main() {
         }
 
         // 先判主动避让，再判四段式退避：
-        //   ⓪ 本轮被单轮上限主动停下 → intervalHours 常规周期（正常收工，不是失败）
+        //   ⓪ 本轮被单轮上限主动停下 → 常规周期（正常收工，不是失败）
         // 四段式退避（2026-09-28 修订。旧三段式把「当日上限」和「单轮上限」混成了一道，
         // 结果每轮下到 301 集就被当彻底失败、退避到次日，白睡一整天）：
-        //   ① 本轮成功            → intervalHours 常规周期
+        //   ① 本轮成功            → 常规周期
         //   ② 失败、但有新增集数   → progressRetryMinutes 后再来（撞的是单轮上限，约 1 小时恢复）
         //   ③ 失败、一集没捞到     → retryMinutes 短试（覆盖瞬时 / 小时级风控）
         //   ④ 失败、短试用尽仍 0 集 → 退避到次日 backoffAt（撞的是当日上限，盲试毫无意义）
-        let waitMs = intervalHours * 60 * 60 * 1000
+        //
+        // 常规周期要按账号数分摊（2026-09-29 多账号）：每个账号自己仍然是 intervalHours
+        // 一轮，所以两轮之间只隔 intervalHours / N —— 2 个账号 = 每 3 小时跑一轮，日产量翻倍。
+        // 除数用**本轮结束后还有余额的账号数**，不是账号总数：某个账号下满了，剩下的账号
+        // 就该恢复成自己的完整周期，不该继续被分摊（否则它得熬到 12 小时才轮到下一次）。
+        // 只有常规周期分摊；重试分支（②③④）不分摊 —— 那是异常路径，该尽快回来看恢复了没有。
+        const activeAfter = activeAccounts.filter(a => remainingOf(a) > 0).length
+        const normalWaitMs = (intervalHours * 60 * 60 * 1000) / Math.max(1, activeAfter)
+        const gapHuman = normalWaitMs >= 3600000
+            ? `${(normalWaitMs / 3600000).toFixed(1)} 小时`
+            : (normalWaitMs >= 60000
+                ? `${Math.round(normalWaitMs / 60000)} 分钟`
+                : `${Math.round(normalWaitMs / 1000)} 秒`)
+        let waitMs = normalWaitMs
         let note = ''
         let stage = 'normal'
         if (cappedThisRound) {
@@ -570,16 +746,16 @@ async function main() {
             // 归零（这一轮确实下到了东西，不是被风控），也不走任何重试分支。
             consecutiveFailures = 0
             stage = 'round-capped'
-            note = `【本轮下到 ${gotThisRound} 集，达到单轮上限 ${roundMax} 集，主动停下（正常收工）`
-                + `；今日累计 ${dailyCount}${dailyCap > 0 ? `/${dailyCap}` : ''} 集，`
-                + `${intervalHours} 小时后下一轮】`
+            note = `【账号 ${account} 本轮下到 ${gotThisRound} 集，达到单轮上限 ${roundMax} 集，`
+                + `主动停下（正常收工）；它今日累计 ${countOf(account)}${dailyCap > 0 ? `/${dailyCap}` : ''} 集，`
+                + `${gapHuman} 后下一轮】`
         } else if (failed > 0 && gotThisRound > 0 && progressRetryMinutes > 0) {
             // 有进展 = 撞的是单轮配额，不是当日额度。**不动 consecutiveFailures**：
             // 它只数「一集没捞到的连续轮次」，所以这一轮既不加也不清零。
             // （别在这里清零 —— 清零会让当日额度真耗尽时又从 6 次短试从头数起，白转 3 小时。）
             stage = 'progress-retry'
             waitMs = progressRetryMinutes * 60 * 1000
-            note = `【本轮失败，但新增 ${gotThisRound} 集 → 撞的是单轮上限（实测约 301 集），`
+            note = `【账号 ${account} 本轮失败，但新增 ${gotThisRound} 集 → 撞的是单轮上限（实测约 301 集），`
                 + `${progressRetryMinutes} 分钟后就恢复，不退避到次日】`
         } else if (failed > 0 && consecutiveFailures < maxRetries) {
             consecutiveFailures++
@@ -588,7 +764,7 @@ async function main() {
             // 措辞说明（2026-09-27 核查后改）：N 记的是**接下来这次**短试的序号，
             // 不是「刚刚失败的是第 N 次」—— 首次失败时也打 1/6，以前写「第 1/6 次短试」
             // 会被误读成「第 1 次重试」，让人以为计数器从 0 起。
-            note = `【本轮失败 → 接下来第 ${consecutiveFailures}/${maxRetries} 次短试】`
+            note = `【账号 ${account} 本轮失败 → 接下来第 ${consecutiveFailures}/${maxRetries} 次短试】`
         } else if (failed > 0) {
             // 注意 consecutiveFailures **继续累加**，别清零 —— 清零会让它退回去重新短试，
             // 于是每天都要空转 3 小时。只有真的成功了才归零。
@@ -598,12 +774,15 @@ async function main() {
             if (w) {
                 waitMs = w.ms
                 // 把 N 的构成写出来，省得再有人问「为什么是 7 而不是 6」
-                note = `【已连续 ${consecutiveFailures} 轮一集没捞到（首轮 + ${maxRetries} 次短试已用尽）→ 退避到 ${w.label}】`
-                    + ` 当日上限实测约 990 集、跨整点不恢复；届时仍失败请查凭据或接口`
+                note = `【账号 ${account} 已连续 ${consecutiveFailures} 轮一集没捞到`
+                    + `（首轮 + ${maxRetries} 次短试已用尽）→ 退避到 ${w.label}】`
+                    + ` 当日上限实测约 990 集/账号、跨整点不恢复；届时仍失败请查凭据或接口`
             } else {
-                note = `【已连续 ${consecutiveFailures} 轮一集没捞到，退回常规周期 —— 请查日志确认不是凭据或接口问题】`
+                note = `【账号 ${account} 已连续 ${consecutiveFailures} 轮一集没捞到，退回常规周期`
+                    + ` —— 请查日志确认不是凭据或接口问题】`
                 consecutiveFailures = 0
                 stage = 'normal'
+                waitMs = normalWaitMs
             }
         } else {
             consecutiveFailures = 0

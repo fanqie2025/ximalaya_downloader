@@ -95,6 +95,26 @@ services:
       # 想退回老的「撞墙才收手」：把这两行删掉或设成 "0"。
       XMD_SCHEDULE_MAX_PER_ROUND: "240"
       XMD_SCHEDULE_DAILY_CAP: "950"
+      # ---- 多账号（2026-09-29 起）----
+      # 逗号分隔的账号名，**顺序就是轮转顺序**。不设 = 只有一个 default 账号。
+      #   default  = 老的 ~/.xmd 目录本身（现有凭据原地不动，向后兼容）
+      #   其它名字 = ~/.xmd/accounts/<名字>/（容器里 /root/.xmd/accounts/<名字>/，
+      #              在同一个挂载卷里，持久化）
+      # 每个账号仍然是「每 XMD_SCHEDULE_INTERVAL_HOURS 一轮」，但**交替上场**，
+      # 所以两轮之间只隔 intervalHours / 账号数 —— 2 个账号 = 每 3 小时跑一轮。
+      # 每个账号各自享有单轮 240 / 当日 950 的预算（平台按账号分别计数），
+      # 日产量因此翻倍；同一时刻永远只有一个账号在下，不会同时下、不会互相抢。
+      # 当日计数按账号分开记在 logs/daily-state.json。
+      #
+      # 加第二个账号：
+      #   1) 本机（要有屏幕，得扫码）：XMD_XMD_DIR=xmd/accounts/bob node login.js
+      #   2) 把 www2-cookies.json / mac-cookies.json / device-info.json 拷到
+      #      飞牛:/vol2/1000/docker/ximalaya-auto/xmd/accounts/bob/
+      #      （device-info.json 直接复用 default 那份就行，同一台机器本来就是同一个指纹）
+      #   3) 这行改成 "default,bob"，再 docker compose -p ximalaya-auto up -d
+      #      —— 只动环境变量，不用 build
+      # 某个账号凭据没配好时只会跳过它（日志里 log.error），其它账号照常跑。
+      XMD_SCHEDULE_ACCOUNTS: "default"
       # 占位符：{title} {anchor} {author} {count} {status}
       XMD_NAMING_TEMPLATE: "《{title}》{anchor} {author}"
     volumes:

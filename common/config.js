@@ -1,4 +1,5 @@
 import fs from "fs";
+import os from "os";
 import {projectRoot} from "../settings.js";
 
 let _config = {
@@ -41,6 +42,10 @@ if (fs.existsSync(`${projectRoot}/settings.local.json`)) {
 const ENV_MAP = {
   XMD_ARCHIVES: ['archives'],
   XMD_XMD_DIR: ['xmd'],
+  // 下载进度库（nedb 的 track.db / album.db）放在哪。
+  // 多账号下它必须**全账号共用一份**：这张表就是「这集下过没有」的唯一依据，
+  // 各账号各记一份的话，同一集会被每个账号各下一遍。不配就退回老行为（跟着 xmd 目录）。
+  XMD_DB_DIR: ['dbDir'],
   XMD_QUALITY_MODE: ['quality', 'mode'],
   XMD_QUALITY_PAID_LEVEL: ['quality', 'paidLevel'],
   XMD_NAMING_TEMPLATE: ['naming', 'template'],
@@ -61,6 +66,10 @@ const ENV_MAP = {
   // 当天累计下满 dailyCap 集就睡到次日 backoffAt。都是 0 / off 关掉，退回「撞墙才收手」。
   XMD_SCHEDULE_MAX_PER_ROUND: ['schedule', 'maxPerRound'],
   XMD_SCHEDULE_DAILY_CAP: ['schedule', 'dailyCap'],
+  // 多账号（2026-09-29）：逗号分隔的账号名，如 "default,bob"。
+  //   default = 根 xmd 目录（老凭据不用搬）；其它名字 = <xmd>/accounts/<名字>/。
+  // 不配就是单账号，行为和以前完全一样。上面那两个上限是**按账号各算一份**的。
+  XMD_SCHEDULE_ACCOUNTS: ['schedule', 'accounts'],
   // DNS 兜底相关，见 common/dnsfix.js
   XMD_DNS_ENABLED: ['dns', 'enabled'],
   XMD_DNS_SERVERS: ['dns', 'servers'],
@@ -93,3 +102,16 @@ for (const [env, keys] of Object.entries(ENV_MAP)) {
 }
 
 export const config = _config
+
+/**
+ * 下载进度库（nedb）所在目录。
+ *
+ * 为什么单独拎出来：多账号下每个账号有自己的凭据目录（XMD_XMD_DIR 指向
+ * <xmd>/accounts/<名字>，cookie 和设备指纹都在里面），但「这集下过没有」这张表
+ * 必须全局一份 —— 否则两个账号各自记各自，同一集会被下两遍。
+ * 没配 XMD_DB_DIR 时退回老行为：就在 xmd 目录里（单账号完全不变）。
+ */
+export function dbDirPath() {
+    const p = config.dbDir || config.xmd || '~/.xmd'
+    return String(p).replace('~', os.homedir())
+}

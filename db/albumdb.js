@@ -1,6 +1,5 @@
 import Datastore from 'nedb'
-import {config} from "../common/config.js";
-import os from 'os'
+import {dbDirPath} from "../common/config.js";
 import path from 'path'
 
 /**
@@ -8,7 +7,7 @@ import path from 'path'
  */
 
 const db = new Datastore({
-    filename : path.join(config.xmd.replace('~', os.homedir()),'db','file','album.db'),
+    filename : path.join(dbDirPath(),'db','file','album.db'),
     autoload: true
 });
 
