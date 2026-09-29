@@ -1,4 +1,5 @@
 import {iaxios} from '../common/axioscf.js'
+import {normalizeAudioExtension} from '../common/naming.js'
 import {config} from '../common/config.js'
 import {log} from '../common/log4jscf.js'
 import {sleep, buildHeaders, parseCookies, addCookie, convertCookiesToString} from '../common/utils.js'
@@ -533,17 +534,12 @@ class AbstractDownloader {
             throw new Error('数据为空');
         }
 
-        // 获取文件后缀函数
-        function getFileExtension(contentType) {
-            const parts = contentType.split('/');
-            if (parts.length === 2) {
-                return '.' + parts[1].replace("x-", "");
-            }
-            return '';
-        }
-
+        // 后缀统一交给 common/naming.js 判，别在这里各写一份：
+        // 老实现是拿 content-type 的小段当后缀，于是 audio/mp4 落成 .mp4（《道诡异仙》那 42 集的由来）、
+        // audio/mpeg 落成 .mpeg、audio/x-ms-wma 落成 .ms-wma、content-type 缺失落成空后缀 ——
+        // 这些名字扫库时都不算音频，下好的集在面板上永远显示欠着。
         const contentType = response.headers['content-type'];
-        const fileExtension = getFileExtension(contentType)
+        const fileExtension = normalizeAudioExtension(contentType, url)
 
         return {
             buffer: response.data,

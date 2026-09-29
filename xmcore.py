@@ -34,16 +34,30 @@ PROXY_KEYS = (
     "all_proxy", "ALL_PROXY",
 )
 
+# node 的查找顺序（公开仓库里不写任何个人路径，见 node_bin()）：
+#   1) 自带的便携版 node/node[.exe]（相对项目根）
+#   2) 环境变量 XMD_NODE 指定的可执行文件
+#   3) PATH 里的 node
+#   4) 几个常见安装位置
+NODE_ENV = "XMD_NODE"
 NODE_CANDIDATES = [
-    # 优先用工具自带的便携版 Node —— 不依赖 WorkBuddy / 系统里那份，
-    # 那些位置随软件更新会变，靠不住。
+    # 优先用工具自带的便携版 Node —— 不依赖系统里那一份。
     Path("node/node.exe"),
-    Path(r"C:\Users\Administrator\.workbuddy\binaries\node\versions\22.22.2-3\node.exe"),
-    Path(r"D:\nodejs\node.exe"),
+    Path("node/node"),
+    Path("node/bin/node"),
+]
+NODE_COMMON = [
     Path(r"C:\Program Files\nodejs\node.exe"),
+    Path(r"C:\Program Files (x86)\nodejs\node.exe"),
+    Path("/usr/local/bin/node"),
+    Path("/usr/bin/node"),
+    Path("/opt/homebrew/bin/node"),
 ]
 
-AUDIO_EXT = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".wma"}
+# 与 JS 侧 common/naming.js 的 isAudioFileName 保持同一套后缀：
+# 曾经漏掉 .mp4，害得音频被判成「没下」。
+AUDIO_EXT = {".m4a", ".mp4", ".m4b", ".mp3", ".mp2", ".aac", ".flac",
+             ".ogg", ".oga", ".opus", ".wav", ".wma"}
 NUM_PREFIX = re.compile(r"^(\d{1,5})\s*[.、_\-\s]\s*(.*)$")
 
 QUALITY_LABELS = {
@@ -100,13 +114,31 @@ def project_root() -> Path:
 
 def node_bin() -> str | None:
     """找 node。相对路径一律相对「项目根」解析 ——
-    双击 exe 启动时工作目录不一定是 exe 所在目录，用 os.getcwd() 会找错地方。"""
+    双击 exe 启动时工作目录不一定是 exe 所在目录，用 os.getcwd() 会找错地方。
+
+    顺序：自带便携版 → 环境变量 XMD_NODE → PATH → 常见安装位置。
+    公开仓库里不放个人路径：以前写死了某台机器的 WorkBuddy / D:\\nodejs，
+    换个环境就是死路，也会把个人目录结构泄出去。
+    """
     root = project_root()
     for p in NODE_CANDIDATES:
         cand = p if p.is_absolute() else (root / p)
         if cand.exists():
             return str(cand)
-    return shutil.which("node")
+    env_node = os.environ.get(NODE_ENV, "").strip()
+    if env_node:
+        cand = Path(env_node)
+        if not cand.is_absolute():
+            cand = root / cand
+        if cand.exists():
+            return str(cand)
+    found = shutil.which("node")
+    if found:
+        return found
+    for p in NODE_COMMON:
+        if p.exists():
+            return str(p)
+    return None
 
 
 def child_env() -> dict:

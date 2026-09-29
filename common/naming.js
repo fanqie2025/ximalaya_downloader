@@ -197,27 +197,181 @@ export function trackFileName(track, album, extension) {
 }
 
 /**
- * 目录里是否已经有这一集。
+ * 「这一集到底在不在」的唯一判据 —— 三处共用，不再各写一份。
  *
- * 光看 DB 里的 path 不够：用户可能手工补过零、改过目录名，
- * 那样 DB 的记录就失效了，下载器会认为文件不存在而重下一遍。
- * 这里再按「序号前缀」在目录内兜一次底。
- * @returns 命中的完整路径，没有则 null
+ * 使用者：扫库计数（common/library.js）、下载跳过 / 过期路径修正（xmd.js）、
+ * 半成品识别（xmd.js 的原子写入）。历史上这三处判据不一致，代价是实打实的：
+ *   - 扫库只认 m4a/mp3/… 不认 mp4，而喜马拉雅有一部分集就是用
+ *     `Content-Type: audio/mp4` 下发的（AAC 装在 MP4 盒子里，与 .m4a 同构），
+ *     落盘就成了 `.mp4`。于是《道诡异仙》42 集被面板报成欠集（报「差 46 集」，实差 4 集）。
+ *   - 下载跳过那一侧只看 `startsWith(num + '.')`，不看扩展名 —— 那么
+ *     `0686.jpg`、写到一半的 `0686.xxx.m4a.part` 都算「已下好」：
+ *     下载器跳过它、扫库又不把它当音频，两边永远对不上，而且这集再也不会被下载。
  */
-export function findExistingTrack(targetDir, num, album) {
-    if (!fs.existsSync(targetDir)) return null
+export const AUDIO_EXT_RE = /\.(m4a|mp4|m4b|mp3|mp2|aac|flac|ogg|oga|opus|wav|wma)$/i
+
+/** 原子写入的半成品后缀：内容可能只写了一半，永远不算「这一集已经有了」 */
+export const PARTIAL_EXT = '.part'
+
+/** 是不是音频文件（只看扩展名） */
+export function isAudioFileName(name) {
+    return AUDIO_EXT_RE.test(String(name == null ? '' : name))
+}
+
+/** 是不是还没下完的半成品 */
+export function isPartialFileName(name) {
+    return String(name == null ? '' : name).toLowerCase().endsWith(PARTIAL_EXT)
+}
+
+/** 序号前缀：补零与不补零两种写法都算命中（用户手工补过零也不重下） */
+export function trackNumPrefixes(num, album) {
     const w = padWidth(album)
     const prefixes = []
     if (w > 0) prefixes.push(String(num).padStart(w, '0'))
     prefixes.push(String(num))
+    return prefixes
+}
+
+/** 目录里的这一行，是不是「前缀为 prefix 的那一集」：前缀对上 + 是音频 + 不是半成品 */
+export function trackFileNameMatches(name, prefix) {
+    const f = String(name == null ? '' : name)
+    if (!f.startsWith(String(prefix) + '.')) return false
+    return isAudioFileName(f) && !isPartialFileName(f)
+}
+
+/** 目录里的这一行，是不是「第 num 集」 */
+export function isTrackFileName(name, num, album) {
+    return trackNumPrefixes(num, album).some(p => trackFileNameMatches(name, p))
+}
+
+/**
+ * 放宽一档的判据：序号后面少了那个点的文件也算这一集。
+ *
+ * 为什么需要：实测库里有 `2551完结.m4a`、`2552主题曲《荣耀》合唱版.m4a` 这类
+ * 手改过的名字（当年补下时把 `2551.完结.m4a` 的点敲掉了）。严格判据认不出它们，
+ * 于是这集会被当成「没有」再下一遍，目录里就多出一份重复音频、白烧额度。
+ * 放宽的边界很小心：序号后面**必须不是数字**，这样 `25510.xx.m4a`（第 25510 集）
+ * 不会被当成第 2551 集；扩展名与半成品仍然要过同一套判据。
+ */
+export function trackFileNameMatchesLoose(name, prefix) {
+    const f = String(name == null ? '' : name)
+    const p = String(prefix)
+    if (!f.startsWith(p)) return false
+    const rest = f.slice(p.length)
+    if (rest === '' || /^[0-9]/.test(rest)) return false
+    return isAudioFileName(f) && !isPartialFileName(f)
+}
+
+/**
+ * 扫一次目录，得到「第几集 → 文件名」的索引。
+ *
+ * 为什么要索引而不是每集都 readdir：老实现是每一集都 `readdirSync` 一遍目录
+ * （`findExistingTrack`），一本 2600 集的专辑就是 2600 次目录遍历；
+ * 而补路径的老流程又是「每轮从第 1 集起逐条 walk」，实测 3.7 分钟只推进 56 集。
+ * 扫一次建索引，整本专辑的对账/补路径都是 O(集数)。
+ * 同号多个文件时严格写法优先（`0008.a.m4a` 胜过 `8标题.m4a`）。
+ */
+export function buildDiskIndex(targetDir, album) {
+    const index = new Map()
+    if (!targetDir || !fs.existsSync(targetDir)) return index
     let entries
     try {
         entries = fs.readdirSync(targetDir)
     } catch (e) {
-        return null
+        return index
     }
+    const loose = new Map()
+    for (const name of entries) {
+        const m = /^([0-9]+)/.exec(name)
+        if (!m) continue
+        const prefix = m[1]
+        const num = Number(prefix)
+        if (trackFileNameMatches(name, prefix)) {
+            if (!index.has(num)) index.set(num, name)
+        } else if (trackFileNameMatchesLoose(name, prefix)) {
+            if (!loose.has(num)) loose.set(num, name)
+        }
+    }
+    for (const [num, name] of loose) {
+        if (!index.has(num)) index.set(num, name)
+    }
+    return index
+}
+
+/**
+ * `Content-Type` → 落盘扩展名。
+ *
+ * 为什么不能直接拿 content-type 的小段当后缀（老实现 `'.' + parts[1].replace('x-','')`）：
+ *   - `audio/mpeg` 会落成 `.mpeg`，`audio/x-ms-wma` 会落成 `.ms-wma` —— 都不是音频后缀，
+ *     扫库不认，下好的集永远显示欠着；
+ *   - `audio/mp4` 落成 `.mp4` —— 就是《道诡异仙》那 42 集的由来；
+ *   - content-type 缺失（`application/octet-stream`）会落成**空后缀**，同样是扫库不认。
+ * 认不出来时退到下载链接上的后缀，再认不出来宁可给 `.m4a`（ABS 认），绝不给空后缀。
+ */
+const CONTENT_TYPE_EXT = {
+    'audio/mp4': '.m4a',
+    'audio/m4a': '.m4a',
+    'audio/x-m4a': '.m4a',
+    'audio/mp4a-latm': '.m4a',
+    'audio/mp3': '.mp3',
+    'audio/mpeg': '.mp3',
+    'audio/mpeg3': '.mp3',
+    'audio/x-mpeg': '.mp3',
+    'audio/aac': '.aac',
+    'audio/aacp': '.aac',
+    'audio/flac': '.flac',
+    'audio/x-flac': '.flac',
+    'audio/ogg': '.ogg',
+    'audio/opus': '.opus',
+    'audio/wav': '.wav',
+    'audio/wave': '.wav',
+    'audio/x-wav': '.wav',
+    'audio/wma': '.wma',
+    'audio/x-ms-wma': '.wma',
+    'video/mp4': '.mp4',
+    'video/x-m4v': '.mp4',
+}
+
+export function normalizeAudioExtension(contentType, url) {
+    const ct = String(contentType == null ? '' : contentType).split(';')[0].trim().toLowerCase()
+    if (CONTENT_TYPE_EXT[ct]) return CONTENT_TYPE_EXT[ct]
+    let fromUrl = ''
+    try {
+        const m = /\.([a-z0-9]{2,5})$/i.exec(new URL(String(url)).pathname)
+        if (m) fromUrl = '.' + m[1].toLowerCase()
+    } catch (e) {
+        // 不是完整 URL（相对路径/空值），忽略
+    }
+    if (fromUrl !== '' && isAudioFileName('x' + fromUrl)) return fromUrl
+    return '.m4a'
+}
+
+/**
+ * 目录里是否已经有这一集。
+ *
+ * 光看 DB 里的 path 不够：用户可能手工补过零、改过目录名，
+ * 那样 DB 的记录就失效了，下载器会认为文件不存在而重下一遍。
+ * 这里再按「序号前缀」在目录内兜一次底 —— 判据统一走上面的 AUDIO_EXT_RE，
+ * 免得把封面图、半成品当成已下好的集。
+ * @returns 命中的完整路径，没有则 null
+ */
+export function findExistingTrack(targetDir, num, album, entries) {
+    if (!fs.existsSync(targetDir)) return null
+    if (entries == null) {
+        try {
+            entries = fs.readdirSync(targetDir)
+        } catch (e) {
+            return null
+        }
+    }
+    const prefixes = trackNumPrefixes(num, album)
     for (const p of prefixes) {
-        const hit = entries.find(f => f.startsWith(p + '.'))
+        const hit = entries.find(f => trackFileNameMatches(f, p))
+        if (hit) return path.join(targetDir, hit)
+    }
+    // 严格写法没找到，再认一遍手改过名字的（`2551完结.m4a`）—— 不然会重下一份
+    for (const p of prefixes) {
+        const hit = entries.find(f => trackFileNameMatchesLoose(f, p))
         if (hit) return path.join(targetDir, hit)
     }
     return null

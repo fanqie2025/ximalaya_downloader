@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>喜马拉雅下载 · 控制台</title>
+<style>
+:root{
+  --bg:#f3f4f6; --card:#fff; --fg:#16181d; --muted:#6b7280; --line:#e4e6ea;
+  --accent:#c8342f; --accent-fg:#fff; --ok:#177f45; --warn:#a5691a; --err:#c02626;
+  --bar:#e8eaee; --chip:#f0f1f4; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0e1014; --card:#171a20; --fg:#e7e9ec; --muted:#98a1ab; --line:#262b34;
+    --accent:#d94a44; --ok:#43bd7c; --warn:#d5a04c; --err:#e06661;
+    --bar:#232833; --chip:#20242c;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:880px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:17px;margin:0;letter-spacing:.3px;font-weight:600}
+h2{font-size:13px;margin:0 0 10px;color:var(--muted);font-weight:600;letter-spacing:.5px}
+.top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.spacer{flex:1}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+.chip{display:inline-flex;align-items:center;gap:6px;background:var(--chip);
+  border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:12px;color:var(--muted)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex:none}
+.dot.run{background:var(--ok);animation:pulse 1.4s infinite}
+.dot.pause{background:var(--warn)}
+.dot.sleep{background:#4a7fd4}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+button{font:inherit;font-size:13px;padding:6px 14px;border-radius:7px;cursor:pointer;
+  border:1px solid var(--line);background:var(--card);color:var(--fg);transition:.15s}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+button.primary:hover{filter:brightness(1.08);color:var(--accent-fg)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button:disabled:hover{border-color:var(--line);color:var(--fg)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input[type=text]{flex:1;min-width:200px;font:inherit;font-size:13px;padding:7px 11px;border-radius:7px;
+  border:1px solid var(--line);background:var(--bg);color:var(--fg)}
+input[type=text]:focus{outline:none;border-color:var(--accent)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
+.kv{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 11px}
+.kv .k{font-size:11px;color:var(--muted);margin-bottom:2px}
+.kv .v{font-size:13px;font-weight:600;word-break:break-all}
+.alb{border-top:1px solid var(--line);padding:12px 0}
+.alb:first-child{border-top:none}
+.alb-h{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.alb-t{font-size:14px;font-weight:600;word-break:break-all}
+.alb-m{font-size:12px;color:var(--muted);font-family:var(--mono)}
+.bar{height:6px;background:var(--bar);border-radius:99px;overflow:hidden;margin:8px 0 4px}
+.bar>i{display:block;height:100%;background:var(--accent);border-radius:99px;transition:width .4s}
+.bar.done>i{background:var(--ok)}
+.alb-f{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+.alb-f .grow{flex:1}
+.log{background:#0b0d11;color:#c8cdd4;border-radius:8px;padding:10px 12px;height:320px;overflow:auto;
+  font:12px/1.65 var(--mono);white-space:pre-wrap;word-break:break-all;border:1px solid var(--line)}
+.log .w{color:#e0b060}.log .e{color:#e0756f}
+.hint{font-size:12px;color:var(--muted);margin-top:8px}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--fg);color:var(--bg);
+  padding:8px 16px;border-radius:8px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:9}
+.toast.on{opacity:.94}
+.empty{color:var(--muted);font-size:13px;padding:14px 0;text-align:center}
+details summary{cursor:pointer;font-size:13px;color:var(--muted);font-weight:600;letter-spacing:.5px;
+  list-style:none;user-select:none}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:"▸ ";font-size:11px}
+details[open] summary::before{content:"▾ "}
+details summary:hover{color:var(--accent)}
+
+/* 账号卡片（v7） */
+.acc{border-top:1px solid var(--line);padding:12px 0}
+.acc:first-child{border-top:none}
+.acc-h{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.acc-n{font-size:14px;font-weight:600}
+.acc-m{font-size:12px;color:var(--muted);font-family:var(--mono);word-break:break-all}
+.badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:2px 9px;
+  font-size:11px;border:1px solid var(--line);background:var(--chip);color:var(--muted)}
+.badge.ok{color:var(--ok);border-color:var(--ok)}
+.badge.bad{color:var(--err);border-color:var(--err)}
+.badge.off{color:var(--warn);border-color:var(--warn)}
+.acc-b{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.acc-b button{font-size:12px;padding:4px 10px}
+.acc-sub{font-size:12px;color:var(--muted);margin-top:4px}
+.mask{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;
+  justify-content:center;padding:16px;z-index:20}
+.mask.on{display:flex}
+.modal{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;
+  width:100%;max-width:540px;max-height:88vh;overflow:auto}
+.modal-h{display:flex;align-items:center;gap:10px;margin-bottom:12px;font-size:14px}
+.qr{display:flex;flex-direction:column;align-items:center;gap:8px;background:#fff;
+  border-radius:10px;padding:12px;margin:10px 0}
+.qr img{width:250px;height:250px;image-rendering:pixelated}
+.qr .t{color:#333;font-size:12px}
+textarea{width:100%;min-height:130px;font:12px/1.5 var(--mono);padding:9px 11px;border-radius:7px;
+  border:1px solid var(--line);background:var(--bg);color:var(--fg);resize:vertical}
+textarea:focus{outline:none;border-color:var(--accent)}
+.mono{font-family:var(--mono);font-size:12px;word-break:break-all}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <h1>喜马拉雅下载 · 控制台</h1>
+    <span class="chip" id="chip-phase"><i class="dot" id="dot"></i><span id="phase-text">连接中</span></span>
+    <span class="spacer"></span>
+    <span class="chip" id="chip-uptime">已运行 -</span>
+  </div>
+
+  <div class="card">
+    <h2>总览</h2>
+    <div class="grid">
+      <div class="kv"><div class="k">订阅专辑</div><div class="v" id="sum-albums">-</div></div>
+      <div class="kv"><div class="k">已完成</div><div class="v" id="sum-done">-</div></div>
+      <div class="kv"><div class="k">待下载</div><div class="v" id="sum-pending">-</div></div>
+      <div class="kv"><div class="k">当前轮次</div><div class="v" id="sum-round">-</div></div>
+    </div>
+    <div class="bar" id="sum-bar" style="margin-top:12px"><i style="width:0"></i></div>
+    <div class="hint" id="sum-hint">-</div>
+  </div>
+
+  <div class="card">
+    <h2>控制</h2>
+    <div class="row">
+      <button class="primary" id="btn-pause">暂停</button>
+      <button id="btn-resume">继续</button>
+      <button id="btn-run">立即跑一轮</button>
+      <span class="spacer"></span>
+      <span class="chip" id="chip-next">-</span>
+    </div>
+    <div class="hint" id="now-hint">-</div>
+  </div>
+
+  <div class="card">
+    <h2>账号</h2>
+    <div class="row">
+      <input type="text" id="in-acc" placeholder="新账号名（字母/数字/下划线，如 bob）" autocomplete="off">
+      <button class="primary" id="btn-acc-add">添加账号</button>
+      <span class="spacer"></span>
+      <span class="chip" id="chip-acc">-</span>
+    </div>
+    <div id="accounts" style="margin-top:10px"><div class="empty">加载中…</div></div>
+    <div class="hint">同一时间只有一个账号在下载（交替上阵），每个账号各自有每日上限，用满自动换下一个。
+      账号失效会在轮到他之前被自动探测出来、禁用并换人，不用你盯着。</div>
+  </div>
+
+  <div class="card">
+    <h2>库中已有书籍</h2>
+    <div class="row">
+      <span class="chip" id="chip-lib">-</span>
+      <span class="spacer"></span>
+      <button id="btn-lib-scan">重新扫描</button>
+    </div>
+    <div class="row" id="lib-tabs" style="margin-top:8px"></div>
+    <div id="library" style="margin-top:10px"><div class="empty">加载中…</div></div>
+    <div class="hint">这一栏看的是下载目录里实际有什么，不是订阅列表。分两页：<b>未完成</b>里是还差集数的
+      （点「继续下载」才进队列，程序不会自己开工）和认不出专辑的；<b>已完成</b>里是下完的、以及标过
+      「非本站」的。同一张专辑要是下进了两个目录，会自动合并成一条、写清还有哪几个目录，不再重复计数。
+      目录名跟专辑名对不上的，点「绑定专辑」填一次 ID 就记住了（顺带补上封面和简介）。</div>
+  </div>
+
+  <div class="card">
+    <h2>添加订阅</h2>
+    <div class="row">
+      <input type="text" id="in-album" placeholder="粘贴专辑链接，或直接填专辑 ID（如 22216262）" autocomplete="off">
+      <button class="primary" id="btn-add">添加</button>
+    </div>
+    <div class="hint">加完不用重启容器：正闲着会立刻开工，正在下载则等当前专辑结束。</div>
+  </div>
+
+  <div class="card">
+    <h2>订阅列表</h2>
+    <div id="albums"><div class="empty">加载中…</div></div>
+  </div>
+
+  <div class="card">
+    <details id="logbox">
+      <summary>运行日志（最近 400 行）</summary>
+      <div class="log" id="log" style="margin-top:10px"></div>
+    </details>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<div class="mask" id="mask">
+  <div class="modal">
+    <div class="modal-h">
+      <b id="modal-title">-</b>
+      <span class="spacer" style="flex:1"></span>
+      <button id="modal-close">关闭</button>
+    </div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<script src="/panel/app.js"></script>
+</body>
+</html>

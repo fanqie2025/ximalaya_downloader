@@ -114,7 +114,22 @@ export const config = _config
  * 必须全局一份 —— 否则两个账号各自记各自，同一集会被下两遍。
  * 没配 XMD_DB_DIR 时退回老行为：就在 xmd 目录里（单账号完全不变）。
  */
+/**
+ * 展开路径开头的 `~`。
+ *
+ * 为什么不能整串 replace('~', …)：Windows 的 8.3 短名里就带 `~`
+ * （os.tmpdir() 在 Windows 上会给出 `C:\Users\ADMINI~1\…`），一刀切替换会把它
+ * 拼成 `C:\Users\Administrator…1\…` 这种不存在的路径。只认开头的 `~`，
+ * 且只认紧跟着分隔符（或就是一个 `~`）的那些。
+ */
+export function expandHome(p) {
+    const s = String(p == null ? '' : p)
+    if (s === '~') return os.homedir()
+    const m = /^~([/\\])(.*)$/.exec(s)
+    return m ? os.homedir() + m[1] + m[2] : s
+}
+
 export function dbDirPath() {
     const p = config.dbDir || config.xmd || '~/.xmd'
-    return String(p).replace('~', os.homedir())
+    return expandHome(p)
 }

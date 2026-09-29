@@ -13,9 +13,11 @@
  */
 import fs from 'fs'
 import path from 'path'
-import {albumDirName} from './naming.js'
+import {albumDirName, isAudioFileName} from './naming.js'
 
-const AUDIO_RE = /\.(m4a|mp3|m4b|aac|flac|ogg|opus|wav|wma)$/i
+// 音频判据统一放在 naming.js（isAudioFileName / AUDIO_EXT_RE）：
+// 这里原来自己写了一份更窄的名单，漏了 .mp4，而下载跳过那一侧按前缀命中任意扩展名 ——
+// 两套判据不一致的直接后果是《道诡异仙》42 集被算成欠集。
 const IMAGE_RE = /\.(jpg|jpeg|png|webp|gif|bmp)$/i
 
 /** 专辑身份的小抄，写进专辑目录里；点开目录一眼就知道这是哪张专辑 */
@@ -54,6 +56,66 @@ export function writeSidecar(dir, album) {
         return true
     } catch (e) {
         return false
+    }
+}
+
+/**
+ * 这本专辑现在该写进哪个目录。
+ *
+ * 为什么不能只算 albumDirName：用户可能手工改过目录名（实测《道诡异仙》被改成
+ * `《道诡异仙》主播：传说中的方片K 1303集完`），平台也可能改了主播名。名称一变，
+ * 算出来的目录就和磁盘上那个对不上了 —— 老实现会另建一个新名字的空目录，
+ * 把这本 1300 集的专辑从头下一遍（实测第 3 轮就这么往新目录里重下了 56 集）。
+ *
+ * 所以先找「带同一 albumId sidecar 的兄弟目录」：集数最多的那个就沿用，
+ * 只有算出来的名字确实更完整（或没有别的候选）时才用它。
+ */
+export function resolveAlbumDir(outputRoot, album, albumMeta) {
+    const canonicalName = albumDirName(album, albumMeta)
+    const canonicalDir = path.join(outputRoot, canonicalName)
+    const albumId = album && album.albumId != null ? String(album.albumId) : ''
+    const candidates = []
+    if (albumId !== '' && fs.existsSync(outputRoot)) {
+        let names = []
+        try {
+            names = fs.readdirSync(outputRoot)
+        } catch (e) {
+            names = []
+        }
+        for (const name of names) {
+            const dir = path.join(outputRoot, name)
+            try {
+                if (!fs.statSync(dir).isDirectory()) continue
+            } catch (e) {
+                continue
+            }
+            const sidecar = readSidecar(dir)
+            if (sidecar == null || String(sidecar.albumId) !== albumId) continue
+            candidates.push({name: name, dir: dir, audio: countAudioIn(dir)})
+        }
+    }
+    const canonicalHit = candidates.find(c => c.dir === canonicalDir)
+    const bestOther = candidates
+        .filter(c => c.dir !== canonicalDir)
+        .sort((a, b) => b.audio - a.audio || (a.name < b.name ? -1 : 1))[0]
+    if (bestOther && (!canonicalHit || bestOther.audio > canonicalHit.audio)) {
+        return {
+            dir: bestOther.dir,
+            name: bestOther.name,
+            reused: true,
+            audio: bestOther.audio,
+            canonicalName: canonicalName,
+        }
+    }
+    return {dir: canonicalDir, name: canonicalName, reused: false}
+}
+
+/** 数目录里的音频文件（判据与下载/扫库同一套） */
+function countAudioIn(dir) {
+    try {
+        return fs.readdirSync(dir).filter(f => isAudioFileName(f)).length
+    } catch (e) {
+        return 0
     }
 }
 
@@ -100,6 +162,119 @@ export function writeSkip(dir, on, reason) {
     }
 }
 
+/**
+ * 单集忽略：一本里「这几集我不要」。
+ *
+ * 为什么需要：专辑级的 `.xmd-skip` 只能整本放过，管不到单集。而单集一旦被删，
+ * 进度库里那条记录不是 `path: null`（就是文件被删后由 clearStalePaths 置回 null），
+ * 下一轮就**又下回来了** —— 想删的那几集永远删不掉。
+ *
+ * 规则落在专辑目录里的 `.xmd-ignore.json`，跟着书走（换机器、换库、换账号都在）：
+ *   - 面板写 `nums`（集号，支持 `651,656-660`）与 `patterns`（标题正则）；
+ *   - 下载器用同一个判据 `ignoreMatches` 解析出真正命中的集号，写回 `resolved`，
+ *     同时把命中的记录在进度库里打上 `skip: true`；
+ *   - 面板按 `resolved` 把「还差 N 集」算准（`resolved` 只记**磁盘上没有的**，
+ *     所以不会和已下好的集重复扣）。
+ * **只是标记，音频文件一个都不动。**
+ */
+export const IGNORE_NAME = '.xmd-ignore.json'
+
+const numList = v => (Array.isArray(v) ? v.map(Number).filter(n => Number.isFinite(n)) : [])
+
+/** 读单集忽略规则：没有或读坏了都返回 null */
+export function readIgnore(dir) {
+    if (!dir) return null
+    try {
+        const p = path.join(dir, IGNORE_NAME)
+        if (!fs.existsSync(p)) return null
+        const o = JSON.parse(String(fs.readFileSync(p, 'utf-8')))
+        if (o == null || typeof o !== 'object') return null
+        return {
+            nums: numList(o.nums),
+            patterns: (Array.isArray(o.patterns) ? o.patterns : []).map(String).filter(s => s !== ''),
+            resolved: numList(o.resolved),
+            reason: String(o.reason == null ? '' : o.reason),
+            at: o.at || null,
+        }
+    } catch (e) {
+        return null
+    }
+}
+
+/**
+ * 写单集忽略规则；`nums` 与 `patterns` 都空就等于取消忽略（删掉文件）。
+ * @param {{nums?: number[], patterns?: string[], resolved?: number[], reason?: string}} spec
+ */
+export function writeIgnore(dir, spec) {
+    if (!dir) return false
+    const p = path.join(dir, IGNORE_NAME)
+    try {
+        const nums = numList(spec && spec.nums)
+        const patterns = ((spec && spec.patterns) || []).map(String).filter(s => s !== '')
+        if (nums.length === 0 && patterns.length === 0) {
+            if (fs.existsSync(p)) fs.unlinkSync(p)
+            return true
+        }
+        const data = {
+            nums: nums,
+            patterns: patterns,
+            reason: String(spec && spec.reason == null ? '' : spec.reason),
+            at: Date.now(),
+        }
+        // resolved 由下载器解析后写回；用户刚改过规则时先清掉，免得用过期的数字
+        const resolved = numList(spec && spec.resolved)
+        if (resolved.length > 0) data.resolved = resolved
+        fs.writeFileSync(p, JSON.stringify(data, null, 2) + '\n')
+        return true
+    } catch (e) {
+        return false
+    }
+}
+
+/**
+ * 「这一集要不要忽略」—— 下载器、进度库自愈、面板三处共用这一个判据。
+ * 坏正则退化成普通子串匹配，不让一条写错的规则把整本卡住。
+ */
+export function ignoreMatches(spec, num, title) {
+    if (spec == null) return false
+    if (Number.isFinite(num) && (spec.nums || []).indexOf(num) >= 0) return true
+    const t = String(title == null ? '' : title)
+    for (const p of spec.patterns || []) {
+        try {
+            if (new RegExp(p).test(t)) return true
+        } catch (e) {
+            if (t.includes(p)) return true
+        }
+    }
+    return false
+}
+
+/**
+ * 面板输入框 → 集号数组：`651,656-660` → `[651,656,657,658,659,660]`。
+ * 支持中英文逗号、空格、以及 `-`/`~`/`～`/`—`/`－` 区间；单次最多 5000 个，防止手滑写出天文数字。
+ */
+export function parseNumSpec(text) {
+    const out = new Set()
+    for (const part of String(text == null ? '' : text).split(/[,，、\s]+/)) {
+        if (part === '') continue
+        const m = /^(\d+)\s*[-~～—－]\s*(\d+)$/.exec(part)
+        if (m) {
+            let a = Number(m[1])
+            let b = Number(m[2])
+            if (a > b) {
+                const t = a
+                a = b
+                b = t
+            }
+            if (b - a > 5000) b = a + 5000
+            for (let i = a; i <= b; i++) out.add(i)
+        } else if (/^\d+$/.test(part)) {
+            out.add(Number(part))
+        }
+    }
+    return [...out].sort((x, y) => x - y)
+}
+
 let cache = {root: '', at: 0, rows: []}
 
 /**
@@ -144,7 +319,7 @@ export function scanLibrary(root, opts = {}) {
         for (const f of files) {
             if (f.isDirectory()) continue
             files_++
-            if (AUDIO_RE.test(f.name)) audio++
+            if (isAudioFileName(f.name)) audio++
             if (IMAGE_RE.test(f.name)) images++
             const lower = f.name.toLowerCase()
             if (lower === 'cover.jpg' || lower === 'folder.jpg' || lower === 'poster.jpg') hasCover = true
@@ -162,6 +337,7 @@ export function scanLibrary(root, opts = {}) {
             audio, files: files_, images, hasCover, hasDesc, hasReader, mtimeMs,
             sidecar: readSidecar(full),
             skip: readSkip(full),
+            ignore: readIgnore(full),
         })
     }
     rows.sort((a, b) => b.mtimeMs - a.mtimeMs || a.name.localeCompare(b.name, 'zh'))
@@ -257,7 +433,16 @@ export function identifyLibrary(rows, albums, meta) {
         }
         const albumId = album && album.albumId != null ? String(album.albumId) : null
         const total = album && Number(album.trackCount) > 0 ? Number(album.trackCount) : null
-        const remaining = total == null ? null : Math.max(0, total - row.audio)
+        // 单集忽略：只扣「磁盘上没有、且用户已标记忽略」的那些（下载器解析后写在 resolved 里）。
+        // 不扣的话，被忽略的集会让这本书永远显示「未下完，还差 N 集」—— 正是用户当初
+        // 想删那几集时遇到的假待办。规则刚写完、下载器还没解析时 ignoredPending 为真，
+        // 这一次先照实报「还差」，下一轮就会对上。
+        const ignoreSpec = row.ignore || null
+        const skipped = ignoreSpec && Array.isArray(ignoreSpec.resolved) ? ignoreSpec.resolved.length : 0
+        const ignoredPending = skipped === 0
+            && ignoreSpec != null
+            && ((ignoreSpec.nums || []).length > 0 || (ignoreSpec.patterns || []).length > 0)
+        const remaining = total == null ? null : Math.max(0, total - row.audio - skipped)
         const ignored = row.skip != null
         return {
             ...row,
@@ -265,9 +450,14 @@ export function identifyLibrary(rows, albums, meta) {
             albumTitle: album && album.albumTitle ? String(album.albumTitle) : '',
             anchorName: album && album.anchorName ? String(album.anchorName) : '',
             total,
+            skipped,
+            ignoredPending,
+            ignoreReason: ignoreSpec ? String(ignoreSpec.reason || '') : '',
+            ignoreNums: ignoreSpec ? (ignoreSpec.nums || []) : [],
+            ignorePatterns: ignoreSpec ? (ignoreSpec.patterns || []) : [],
             remaining,
             // 认不出专辑的书没法判断下没下完 —— complete 给 null，面板上按「未识别」显示
-            complete: total == null ? null : row.audio >= total,
+            complete: total == null ? null : (row.audio + skipped) >= total,
             matchedBy,
             // 标记过「非本站」的书：面板上不再当待办（认不认得出来都一样，用户已经拍过板）
             ignored,

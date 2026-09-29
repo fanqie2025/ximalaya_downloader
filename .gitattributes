@@ -1,0 +1,11 @@
+# 行尾一律 LF（入库与检出都 LF）。
+#
+# 为什么：本项目跑在 Linux 容器（Dockerfile: FROM node:22-slim）和飞牛 NAS 上，
+# 而开发机是 Windows（core.autocrlf=true 时 git 会把工作区文件改成 CRLF，
+# 每次改动都刷一屏 "LF will be replaced by CRLF" 警告，也容易把 CRLF 混进镜像）。
+# 这里显式钉死，谁检出、在哪检出都一样。
+* text=auto eol=lf
+
+# 例外：Windows 批处理必须是 CRLF，否则 cmd 解析会出岔子。
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -74,6 +74,8 @@ trackDB.findOne = (query) => {
 
 trackDB.update = (condition, setEntity) => {
     // 更新数据
+    // 注意：NeDB 的 db.update 默认只改**第一条**命中的文档，补路径这种
+    // 「同一个集号可能有多条重复记录」的场合必须显式 multi:true（见 updateMulti）。
     return new Promise((resolve, reject) => {
         db.update(condition, {$set: setEntity}, (err, numReplaced) => {
             if (err) {
@@ -85,7 +87,21 @@ trackDB.update = (condition, setEntity) => {
     })
 }
 
+trackDB.updateMulti = (condition, setEntity) => {
+    return new Promise((resolve, reject) => {
+        db.update(condition, {$set: setEntity}, {multi: true}, (err, numReplaced) => {
+            if (err) {
+                return reject(err)
+            } else {
+                return resolve(numReplaced)
+            }
+        })
+    })
+}
+
 // 删除数据
+// 注意：options 传 {} 时 NeDB 的 multi 默认是 false —— 这个函数只删**一条**。
+// 要删一批请用 removeMany / removeById。
 trackDB.remove = (condition) => {
     return new Promise((resolve, reject) => {
         db.remove(condition, {}, (err, numReplaced) => {
@@ -94,7 +110,31 @@ trackDB.remove = (condition) => {
             } else {
                 return resolve(numReplaced)
             }
-        });
+        })
+    })
+}
+
+trackDB.removeMany = (condition) => {
+    return new Promise((resolve, reject) => {
+        db.remove(condition, {multi: true}, (err, numRemoved) => {
+            if (err) {
+                return reject(err)
+            } else {
+                return resolve(numRemoved)
+            }
+        })
+    })
+}
+
+trackDB.removeById = (id) => {
+    return new Promise((resolve, reject) => {
+        db.remove({_id: id}, {}, (err, numRemoved) => {
+            if (err) {
+                return reject(err)
+            } else {
+                return resolve(numRemoved)
+            }
+        })
     })
 }
 export {

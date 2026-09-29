@@ -48,6 +48,19 @@ import {
     findCredential,
     accountsFile,
 } from './common/accountstore.js'
+// 当日额度记账（2026-09-30 抽出，④ 代码卫生）：日期、落盘格式、每账号剩余额度、
+// 当日总上限都在 common/dailyquota.js 里，附 test/_t_dailyquota.mjs。
+// 这段算错的后果很实在：少算就顶平台那道当日墙（回的是 ret:1001，跟单轮上限同一个码），
+// 多算就白白少下几百集 —— 所以从调度流程里拆出来单测。
+import {
+    localDateStr,
+    readDailyState,
+    writeDailyState,
+    rollDay,
+    countOf as countIn,
+    remainingFor,
+    totalCap,
+} from './common/dailyquota.js'
 
 const PROXY_KEYS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY']
 
@@ -103,42 +116,14 @@ let dailyCounts = {}   // {账号名: 今天已下的集数}
 // 都不会把当天的计数忘掉。忘掉的后果是当天再下一轮 240 集，直接顶到平台的墙上。
 const dailyStateFile = path.join(projectRoot, 'logs', 'daily-state.json')
 
-function localDateStr(d = new Date()) {
-    const p = n => String(n).padStart(2, '0')
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
-}
-
+// 读取/解析/落盘都在 common/dailyquota.js（附单测）。这里只负责把「文件放哪」
+// 和内存里的两个变量（dailyDate / dailyCounts）接起来 —— 调度器各处读的就是这两个。
 function loadDailyState() {
-    try {
-        const j = JSON.parse(fs.readFileSync(dailyStateFile, 'utf-8'))
-        if (j && typeof j.date === 'string') {
-            // 新格式：{date, accounts:{账号: 集数}}
-            if (j.accounts && typeof j.accounts === 'object' && !Array.isArray(j.accounts)) {
-                const counts = {}
-                for (const [k, v] of Object.entries(j.accounts)) {
-                    if (Number.isFinite(Number(v))) counts[k] = Number(v)
-                }
-                return {date: j.date, counts}
-            }
-            // 旧格式（v5 单账号）：{date, count} —— 那份计数就是 default 账号的
-            if (Number.isFinite(Number(j.count))) {
-                return {date: j.date, counts: {default: Number(j.count)}}
-            }
-        }
-    } catch (e) {
-        // 第一次跑、文件还没生成、或内容坏了：都从「今天 0 集」开始
-    }
-    return {date: localDateStr(), counts: {}}
+    return readDailyState(dailyStateFile)
 }
 
 function saveDailyState() {
-    try {
-        fs.mkdirSync(path.dirname(dailyStateFile), {recursive: true})
-        fs.writeFileSync(dailyStateFile, JSON.stringify({date: dailyDate, accounts: dailyCounts}) + '\n')
-    } catch (e) {
-        // 计数落盘失败只影响「重建容器后记不记得」，不该因此打断下载
-        log.warn(`当日计数写盘失败（不影响本轮）：${e.message}`)
-    }
+    writeDailyState(dailyStateFile, dailyDate, dailyCounts, m => log.warn(m))
 }
 
 /**
@@ -654,8 +639,9 @@ async function main() {
     let consecutiveFailures = 0
 
     // ---- 当日预算：按账号各算各的 ----
+    // 算术在 common/dailyquota.js（带单测），这里只是把当前内存里的计数喂进去。
     function countOf(name) {
-        return Number(dailyCounts[name]) || 0
+        return countIn(dailyCounts, name)
     }
 
     function totalDaily() {
@@ -673,8 +659,7 @@ async function main() {
 
     /** 这个账号今天还能下多少集；没配当日上限就是无限 */
     function remainingOf(name) {
-        if (dailyCap <= 0) return Infinity
-        return Math.max(0, dailyCap - countOf(name))
+        return remainingFor(dailyCounts, name, dailyCap)
     }
 
     // 轮转游标：指向「下一个该出场的账号」。
@@ -856,7 +841,7 @@ async function main() {
                 dir: accountDirs[a],
                 count: countOf(a),
                 cap: dailyCap,
-                left: dailyCap > 0 ? Math.max(0, dailyCap - countOf(a)) : null,
+                left: dailyCap > 0 ? remainingOf(a) : null,
             })),
             // 撞墙冷却（v9）：谁刚被平台挡过、还剩多少秒 —— 面板/`/api/state` 看得出
             // 「现在睡是因为这个账号在冷却，换个账号本来能接着下」。
@@ -890,12 +875,15 @@ async function main() {
 
         let forcedThisRound = false
         // 跨自然日先把当日计数归零 —— 平台那道墙就是按自然日算的（跨整点不恢复）。
-        if (dailyDate !== localDateStr()) {
-            log.info(`跨自然日（${dailyDate} → ${localDateStr()}），各账号当日计数归零`
-                + `（昨天合计 ${totalDaily()} 集：${fmtCounts()}）`)
-            dailyDate = localDateStr()
-            dailyCounts = {}
-            saveDailyState()
+        {
+            const rolled = rollDay(dailyDate, dailyCounts)
+            if (rolled.rolled) {
+                log.info(`跨自然日（${dailyDate} → ${rolled.date}），各账号当日计数归零`
+                    + `（昨天合计 ${totalDaily()} 集：${fmtCounts()}）`)
+                dailyDate = rolled.date
+                dailyCounts = rolled.counts
+                saveDailyState()
+            }
         }
         // 当日预算闸门：**所有账号**都下满才睡到次日。放在轮次编号**之前**，和暂停一样
         // 不占轮次 —— 它是一次「没跑」的等待，不该让页面上的「第 N 轮」虚涨。
@@ -915,7 +903,7 @@ async function main() {
                 + `${w ? ` —— ${w.label} 之后就是新的一天` : ''}`)
             const capHit = await sleepInterruptible(
                 capWaitMs,
-                `今日额度已满（合计 ${totalDaily()}/${dailyCap * activeAccounts.length} 集），休眠 ${capHuman}`)
+                `今日额度已满（合计 ${totalDaily()}/${totalCap(dailyCap, activeAccounts.length)} 集），休眠 ${capHuman}`)
             if (!capHit) continue
             // 被「继续 / 立即跑一轮」打断 = 用户明确要求现在跑，放行这一轮
             log.info('休眠被手动打断 —— 越过当日上限跑这一轮（单轮上限仍然生效）')
@@ -995,13 +983,13 @@ async function main() {
             + (dailyCap > 0
                 ? `　${account} 今日已下 ${countOf(account)}/${dailyCap} 集`
                     + (activeAccounts.length > 1
-                        ? `（全部账号合计 ${totalDaily()}/${dailyCap * activeAccounts.length}）`
+                        ? `（全部账号合计 ${totalDaily()}/${totalCap(dailyCap, activeAccounts.length)}）`
                         : '')
                 : ''))
         // 这一轮最多下多少集：既受单轮上限管，也要给**这个账号**当天剩下的额度留够。
         // 例：单轮 200、当日 950，某个账号前四轮 200×4 = 800，它的第五轮就只给 150。
         let roundMax = 0
-        if (dailyCap > 0) roundMax = Math.max(0, dailyCap - countOf(account))
+        if (dailyCap > 0) roundMax = remainingOf(account)
         if (maxPerRound > 0) roundMax = roundMax > 0 ? Math.min(maxPerRound, roundMax) : maxPerRound
         // 手动越限那一轮里所有账号都已下满，上面算出来是 0 —— 那不代表「不下」，
         // 而是「用户偏要跑」，所以退回单轮上限。（dailyCap 关掉时本来就不会是 0）

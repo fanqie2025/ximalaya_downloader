@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import {config, dbDirPath} from './common/config.js'
+import {config, dbDirPath, expandHome} from './common/config.js'
 import pLimit from 'p-limit';
 import {log} from './common/log4jscf.js'
 import {trackDB} from './db/trackdb.js'
@@ -9,14 +9,15 @@ import {AtomicInteger} from './common/AtomicInteger.js'
 import {sleep} from './common/utils.js'
 import {DownloaderFactory} from './handler/downloader.js'
 import {
-    albumDirName,
+    buildDiskIndex,
     findExistingTrack,
     loadAlbumMeta,
+    PARTIAL_EXT,
     trackFileName,
 } from './common/naming.js'
 import {assetSummary, writeAlbumAssets} from './common/albumassets.js'
-import {writeSidecar} from './common/library.js'
-import os from "os";
+import {readIgnore, resolveAlbumDir, writeIgnore, writeSidecar} from './common/library.js'
+import {pendingQuery, selfHealAlbum, syncIgnoreMarks} from './common/dbselfheal.js'
 import fs from "fs";
 import path from 'path'
 import {mkdirpSync} from "mkdirp";
@@ -65,8 +66,7 @@ function myParseInt(value, dummyPrevious) {
 
 /** `~` 得展开成真实 home，否则会当成字面量建出个叫 ~ 的目录 */
 function resolveOutput(p) {
-    const s = String(p == null ? '' : p)
-    return s.includes('~') ? s.replace('~', os.homedir()) : s
+    return expandHome(p)
 }
 
 /**
@@ -82,16 +82,24 @@ function resolveOutput(p) {
  * 真没了 → 置回 null 让它重新下。
  */
 async function clearStalePaths(albumId, targetDir, album) {
+    // 目录只扫一次，后面按集号查索引 —— 老实现是每查一集 readdirSync 一遍目录，
+    // 2600 集的专辑就是 2600 次目录遍历。
+    const onDisk = buildDiskIndex(targetDir, album)
     const records = await trackDB.find({albumId: albumId, path: {$ne: null}})
     let cleared = 0
     let repaired = 0
     for (const record of records) {
+        // 用户标记「这几集不要」的直接放过：文件在不在都不管，更不能因为文件没了
+        // 就把它置回 path: null（那正是「删了又自己回来」的成因）。
+        if (record.skip === true) {
+            continue
+        }
         if (fs.existsSync(record.path)) {
             continue
         }
-        const existing = record.num == null ? null : findExistingTrack(targetDir, record.num, album)
-        if (existing) {
-            await trackDB.update({'trackId': record.trackId}, {'path': existing})
+        const name = record.num == null ? null : onDisk.get(record.num)
+        if (name) {
+            await trackDB.update({'trackId': record.trackId}, {'path': path.join(targetDir, name)})
             repaired++
             continue
         }
@@ -108,13 +116,12 @@ async function clearStalePaths(albumId, targetDir, album) {
     return cleared
 }
 
-async function download(factory, options, album, track, albumMeta) {
+async function download(factory, options, album, track, targetDir) {
     // 已下载过就跳过。DB 里的 path 是权威判据，但用户手工补过零或改过目录名
     // 会让它失效，所以下面还有一层「按序号在目录里兜底」。
     if (track.path && fs.existsSync(track.path)) {
         return
     }
-    const targetDir = path.join(resolveOutput(options.output), albumDirName(album, albumMeta))
 
     // 目录里已有这一集就把 DB 的路径补正，别重下一遍。
     // 这条分支专门用来收拾「补零/改目录名之后 DB 过期」的历史遗留。
@@ -140,7 +147,13 @@ async function download(factory, options, album, track, albumMeta) {
     // 事后再用脚本重命名是不行的 —— DB 里记的还是旧路径，
     // 下次跑会认为文件不存在而把整张专辑重下一遍。
     const filePath = path.join(targetDir, trackFileName(track, album, data.extension))
-    fs.writeFileSync(filePath, data.buffer)
+    // 先写 `.part` 再改名（同目录内 rename 是原子的）。
+    // 直接写正式名字的话，进程在下到一半时被杀（暂停、额度满、重启、OOM）会留下半截文件，
+    // 而下一轮 findExistingTrack 会按序号前缀认下它 —— 于是这集永远是个坏的、还不会被重下。
+    // 半成品在统一判据（common/naming.js 的 isPartialFileName）里不算「已经有了」。
+    const partPath = filePath + PARTIAL_EXT
+    fs.writeFileSync(partPath, data.buffer)
+    fs.renameSync(partPath, filePath)
     await trackDB.update({'trackId': track.trackId}, {'path': filePath})
     await finishCount.increment()
     await printProgress(track.title, filePath, deviceType)
@@ -158,6 +171,7 @@ async function main() {
         .option('-t, --type <value>', '登录类型,可选值pc、web,默认都登陆(需要扫码多次)')
         .option('-r, --replace', '清除缓存,任务将重新下载')
         .option('--dry-run', '只检查登录态、专辑信息和目录命名，不实际下载')
+        .option('--audit', '只对账进度库与磁盘（顺带自愈），打印报告后退出，不下载')
         .option('-o, --output <value>', '当前要保存的目录,默认为~/Downloads', config.archives);
 
     program.parse(process.argv)
@@ -201,8 +215,16 @@ async function main() {
 
     log.info(`当前专辑:${albumResp.albumTitle},总章节数:${albumResp.trackCount}`)
     const albumMeta = loadAlbumMeta()
-    const targetDir = path.join(resolveOutput(options.output), albumDirName(albumResp, albumMeta))
-    log.info(`专辑目录名:${albumDirName(albumResp, albumMeta)}`)
+    // 目录名不能只靠 albumDirName 算：用户手工改过目录名就会算出一个不存在的名字，
+    // 老实现会另建空目录把这本从头下一遍（实测《道诡异仙》重下了 56 集）。
+    // resolveAlbumDir 先找带同一 albumId sidecar 的兄弟目录。
+    const dirInfo = resolveAlbumDir(resolveOutput(options.output), albumResp, albumMeta)
+    const targetDir = dirInfo.dir
+    if (dirInfo.reused) {
+        log.warn(`算出来的目录名是「${dirInfo.canonicalName}」，但磁盘上已有同一张专辑的目录`
+            + `「${dirInfo.name}」（${dirInfo.audio} 集）—— 沿用已有目录，不另建、不重下`)
+    }
+    log.info(`专辑目录名:${dirInfo.name}`)
 
     // 封面 / 简介 / 主播：顺手存进专辑目录。
     // ABS 的规矩是「书目录里有图片就用它，没有才去音频 ID3 里抠封面」，另外它读
@@ -248,8 +270,12 @@ async function main() {
         album = albumResp
     }
 
-    const iTrackCount = await trackDB.count({'albumId': albumId})
-    if (album.trackCount == iTrackCount) {
+    // 判「章节列表要不要重新拉」得按**不同集号**数，不能按记录条数：
+    // 实测 33476331 有 58 组同集号重复记录，条数永远比 trackCount 多，
+    // 于是每轮都重新拉一遍章节列表（2625 集、每页 30，就是 88 个请求）。
+    const existingTracks = await trackDB.find({'albumId': albumId}, {'num': 1})
+    const distinctNums = new Set(existingTracks.map(t => t.num)).size
+    if (album.trackCount == distinctNums) {
         needFlushTracks = false
     }
     if (needFlushTracks) {
@@ -286,16 +312,67 @@ async function main() {
     }
     // 下载前先清掉过期路径。必须放在统计 taskCount/finishCount 之前，
     // 否则「已完成」的数字是虚的，进度条会一直显示得比实际好。
-    await clearStalePaths(
-        albumId,
-        path.join(resolveOutput(options.output), albumDirName(album, albumMeta)),
-        album)
+    await clearStalePaths(albumId, targetDir, album)
 
-    const condition = {"albumId": albumId, path: null}
+    // 单集忽略：面板在专辑目录里写下的 `.xmd-ignore.json`（那几集我不要）。
+    // 必须在这里落地成进度库的 skip 标记 —— 主循环查的是 `pendingQuery()`，
+    // 标了的集就不会再被下载，删掉也不会自己回来。写者仍然是本进程（面板只写文件，
+    // 不碰 track.db），所以不用担心两边同时开库互相覆盖。
+    const ignoreSpec = readIgnore(targetDir)
+    const ignoreSync = await syncIgnoreMarks(albumId, targetDir, album, ignoreSpec)
+    if (ignoreSync.marked > 0 || ignoreSync.cleared > 0) {
+        log.info(`单集忽略：标记 ${ignoreSync.marked} 集、解除 ${ignoreSync.cleared} 集`
+            + `（共忽略 ${ignoreSync.matched.length} 集，其中 ${ignoreSync.resolved.length} 集磁盘上没有）`)
+    }
+    if (ignoreSpec != null) {
+        const changed = JSON.stringify(ignoreSpec.resolved.slice().sort((a, b) => a - b))
+            !== JSON.stringify(ignoreSync.resolved)
+        if (changed) {
+            // 把解析结果写回规则文件：面板据此把「还差 N 集」算准（只扣磁盘上真没有的）
+            writeIgnore(targetDir, {
+                nums: ignoreSpec.nums,
+                patterns: ignoreSpec.patterns,
+                reason: ignoreSpec.reason,
+                resolved: ignoreSync.resolved,
+            })
+            log.info(`单集忽略：已忽略 ${ignoreSync.resolved.length} 集`
+                + (ignoreSync.resolved.length > 0 ? `（${ignoreSync.resolved.slice(0, 30).join(',')}`
+                    + `${ignoreSync.resolved.length > 30 ? ' …' : ''}）` : ''))
+        }
+    }
 
-    await taskCount.set(await trackDB.count({"albumId": albumId}))
+    // 进度库自愈：老库书（文件都在磁盘上、进度库里却没有记录或记着 null）在这一步
+    // 一次性认下来。不做这一步，主循环会从第 1 集起逐条 walk 着补路径 ——
+    // 实测 3.7 分钟只推进 56 集，一本 1300 集的专辑要二十多轮才认完。
+    const healed = await selfHealAlbum(albumId, targetDir, album, {apply: !options.dryRun})
+    if (healed.backfill.marked > 0) {
+        log.info(`进度库补齐 ${healed.backfill.marked} 集路径（磁盘上已有，不会重下），`
+            + `仍缺 ${healed.backfill.stillMissing} 集`)
+    }
+    if (healed.dedupe.removed > 0) {
+        log.info(healed.dedupe.applied
+            ? `清理了 ${healed.dedupe.removed} 条同集号重复记录（${healed.dedupe.groups} 组）`
+            : `[试运行] 发现 ${healed.dedupe.removed} 条同集号重复记录（${healed.dedupe.groups} 组）`)
+    }
+    log.info(`进度库对账：${healed.audit.rows} 条记录 / ${healed.audit.distinctNums} 个集号，`
+        + `磁盘 ${healed.audit.onDiskFiles} 集，真缺 ${healed.audit.missingOnDisk} 集`
+        + (healed.audit.ghostPaths > 0 ? `，幽灵路径 ${healed.audit.ghostPaths} 条` : '')
+        + (healed.audit.skipped > 0 ? `，已忽略 ${healed.audit.skipped} 集` : ''))
+    if (options.audit) {
+        log.info(`[对账] ${JSON.stringify(healed.audit)}`)
+        return
+    }
+
+    // 待下载查询只此一处定义（`skip: {$ne: true}` 就在 pendingQuery 里）——
+    // 主循环、目录自愈、对账三处共用，免得哪一处漏掉 skip 把忽略的集又下回来。
+    const condition = pendingQuery(albumId)
+
+    // 被忽略的集既不算「要下」，也不算「已完成」—— 否则「已经下载完成」这条
+    // 早退永远走不到（用户忽略的那几集永远补不上）。
+    await taskCount.set(await trackDB.count({"albumId": albumId, "skip": {"$ne": true}}))
     await finishCount.set(await trackDB.count({
         "albumId": albumId,
+        "skip": {"$ne": true},
         "path": {
             $ne: null
         }
@@ -306,7 +383,7 @@ async function main() {
         return
     }
     if (options.dryRun) {
-        log.info(`[试运行] 章节文件会写进：${path.join(resolveOutput(options.output), albumDirName(album, albumMeta))}`)
+        log.info(`[试运行] 章节文件会写进：${targetDir}`)
         log.info(`[试运行] 共 ${await taskCount.get()} 集，已下载 ${await finishCount.get()} 集，` +
             `待下载 ${await taskCount.get() - await finishCount.get()} 集`)
         log.info('[试运行] 未实际下载')
@@ -321,7 +398,7 @@ async function main() {
         }
         const promises = tracks.map(track =>
             limit(async () =>
-                await download(factory, options, album, track, albumMeta)))
+                await download(factory, options, album, track, targetDir)))
         await Promise.all(promises)
         if (options.slow) {
             await sleep(Math.floor(Math.random() * (5000 - 500 + 1)) + 500)
