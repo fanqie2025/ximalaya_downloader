@@ -81,3 +81,9 @@ panel-preview.png
 # （gitignore 管不了已追踪的文件），这里显式声明保留 —— Dockerfile 走的是
 # 「宿主机装好再 COPY」，少了它复现出来的依赖树就不是同一棵
 !package-lock.json
+# --- temporary fingerprint / diag artifacts (device data - never commit) ---
+_fp-*.json
+_fptest.mjs
+_fpprobe.mjs
+_fpcompare.mjs
+_diag*.js
