@@ -365,8 +365,12 @@ class AbstractDownloader {
 
     /**
      * 获取专辑详情
+     *
+     * 顺带把封面地址和简介一起返回：它们本来就在上面这个 simple 响应里
+     * （albumPageMainInfo.cover / richIntro / shortIntro），不取白不取 ——
+     * 以前只挑走标题/主播/集数，这几样当场丢了，想补封面就得再请求一次。
      * @param albumId
-     * @returns {Promise<{trackCount, albumTitle, isFinished, anchorName}>}
+     * @returns {Promise<{trackCount, albumTitle, isFinished, anchorName, coverUrl, richIntro, shortIntro}>}
      */
     async getAlbum(albumId) {
         if (albumId == null) {
@@ -381,7 +385,12 @@ class AbstractDownloader {
             albumTitle: main['albumTitle'],
             isFinished: main['isFinished'],
             anchorName: await this._getAnchorName(albumId, main),
-            trackCount: book.trackTotalCount
+            trackCount: book.trackTotalCount,
+            // 封面是协议相对的 //imagev2.xmcdn.com/...，落盘时由 common/albumassets.js 补 https:
+            coverUrl: main['cover'] || '',
+            // richIntro 是带 HTML 的长简介（长图也塞在里面），shortIntro 是纯文本短简介
+            richIntro: main['richIntro'] || '',
+            shortIntro: main['shortIntro'] || '',
         }
     }
 

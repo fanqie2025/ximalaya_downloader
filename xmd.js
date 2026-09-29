@@ -14,6 +14,8 @@ import {
     loadAlbumMeta,
     trackFileName,
 } from './common/naming.js'
+import {assetSummary, writeAlbumAssets} from './common/albumassets.js'
+import {writeSidecar} from './common/library.js'
 import os from "os";
 import fs from "fs";
 import path from 'path'
@@ -199,7 +201,25 @@ async function main() {
 
     log.info(`当前专辑:${albumResp.albumTitle},总章节数:${albumResp.trackCount}`)
     const albumMeta = loadAlbumMeta()
+    const targetDir = path.join(resolveOutput(options.output), albumDirName(albumResp, albumMeta))
     log.info(`专辑目录名:${albumDirName(albumResp, albumMeta)}`)
+
+    // 封面 / 简介 / 主播：顺手存进专辑目录。
+    // ABS 的规矩是「书目录里有图片就用它，没有才去音频 ID3 里抠封面」，另外它读
+    // desc.txt（简介）与 reader.txt（主播）—— 所以这三样落盘就够了，不用碰音频。
+    // 位置很讲究：必须放在下面「已经下载完成就直接 return」之前 —— 已经下完的
+    // 专辑再跑一次时，正好把当年缺的封面/简介补上（不是每次都要重下才补）。
+    if (!options.dryRun) {
+        try {
+            writeSidecar(targetDir, albumResp)
+            const assets = await writeAlbumAssets(targetDir, albumResp)
+            const sum = assetSummary(assets)
+            log.info(sum === '' ? '封面/简介/主播都已存在，跳过' : `已补上：${sum}`)
+        } catch (e) {
+            // 补附件失败绝不能影响下载本身
+            log.warn(`补封面/简介失败（不影响下载）：${e.message}`)
+        }
+    }
     let album = await albumDB.findOne({"albumId": albumId})
     let needFlushTracks = true
 

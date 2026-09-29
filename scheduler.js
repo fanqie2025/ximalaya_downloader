@@ -33,6 +33,10 @@ import {
     registerChildKiller,
 } from './common/control.js'
 import {startWebServer} from './web.js'
+import {albumDB} from './db/albumdb.js'
+import {loadAlbumMeta} from './common/naming.js'
+import {assetSummary} from './common/albumassets.js'
+import {identifyLibrary, invalidateLibraryCache, scanLibrary} from './common/library.js'
 // 账号名单 + 健康状态（2026-09-29 v7）：网页和调度器读同一份，见 common/accountstore.js
 import {
     readAccounts,
@@ -372,6 +376,116 @@ export function parseAlbumIds(text) {
         if (m) out.push(m[1])
     }
     return [...new Set(out)]
+}
+
+/**
+ * 让子进程 assets.js 去补一张专辑的封面 / 简介 / 主播。
+ *
+ * 为什么又开子进程：`config.xmd`（凭据目录）是进程启动时定死的，多账号下必须靠
+ * XMD_XMD_DIR 指到对应账号 —— 跟 probe-account.js 同一个道理。
+ *
+ * @param {string|number} albumId
+ * @param {string} dir 目标专辑目录
+ * @param {object} accountEnv {XMD_XMD_DIR, XMD_DB_DIR}
+ * @returns {Promise<{ok:boolean, cover?:string, desc?:string, reader?:string, albumTitle?:string, error?:string}>}
+ */
+function runAssets(albumId, dir, accountEnv) {
+    return new Promise(resolve => {
+        let child
+        try {
+            child = spawn(process.execPath, ['assets.js', String(albumId), dir], {
+                cwd: projectRoot,
+                env: childEnv(accountEnv),
+                stdio: ['ignore', 'pipe', 'pipe'],
+            })
+        } catch (e) {
+            return resolve({ok: false, error: e.message})
+        }
+        let buf = ''
+        let settled = false
+        const done = out => {
+            if (settled) return
+            settled = true
+            clearTimeout(timer)
+            resolve(out)
+        }
+        // 补附件是「顺手做的好事」，绝不能拖住一轮下载 —— 90 秒没结果就当它失败
+        const timer = setTimeout(() => {
+            try {
+                child.kill('SIGKILL')
+            } catch (e) {
+                // 已经退了
+            }
+            done({ok: false, error: 'assets.js 超时（90 秒）'})
+        }, 90000)
+        const onData = chunk => {
+            buf += chunk.toString()
+            // 转进容器日志（面板看的是 logs/app.log，那边由 log4js 自己写）
+            process.stdout.write(chunk)
+        }
+        child.stdout.on('data', onData)
+        child.stderr.on('data', onData)
+        child.on('error', e => done({ok: false, error: e.message}))
+        child.on('close', code => {
+            const m = /XMD_ASSETS=(\{.*\})/m.exec(buf)
+            let out = null
+            if (m) {
+                try {
+                    out = JSON.parse(m[1])
+                } catch (e) {
+                    out = null
+                }
+            }
+            done(out || {ok: false, error: `assets.js 退出码 ${code}`})
+        })
+    })
+}
+
+/**
+ * 每轮开跑前扫一遍下载目录（「库里已有的书」）：
+ *
+ *   ① 认得出是哪张专辑、但缺封面/简介/主播的 —— 顺手补上。**不用按钮、不用提示**：
+ *      用户要的是「自己增加下载好的也确认下」，已经下完的书重跑一次也会走到这里
+ *      （xmd.js 里补附件那段特意放在「已完成就 return」之前）。
+ *   ② 没下完的 —— 只在日志里说一句，**绝不自动塞进订阅队列**：接着下会花额度，
+ *      那是人的决定，网页上「库中已有书籍」里有「继续下载」按钮。
+ *
+ * 认不出来的那几本（库里没有专辑记录、目录名也对不上）这里一声不吭，
+ * 交给网页上手工「绑定专辑」——按书名搜索这条路走不通，喜马拉雅风控直接回
+ * `risk invalid`（实测 2026-09-30）。
+ */
+async function refreshLibrary(opts, accountEnv) {
+    let albums = []
+    try {
+        albums = await albumDB.find({})
+    } catch (e) {
+        log.warn(`读专辑记录失败，这次不补库里已有的书：${e.message}`)
+        return []
+    }
+    const rows = identifyLibrary(scanLibrary(opts.output, {force: true}), albums, loadAlbumMeta())
+    let fixed = 0
+    for (const r of rows) {
+        if (r.albumId == null) continue
+        if (r.hasCover && r.hasDesc && r.hasReader) continue
+        const out = await runAssets(r.albumId, r.dir, accountEnv)
+        if (out.ok) {
+            const sum = assetSummary(out)
+            if (sum !== '') {
+                log.info(`库里《${r.albumTitle || r.name}》补上：${sum}`)
+                fixed++
+            }
+        } else {
+            log.warn(`库里《${r.name}》补封面/简介失败：${out.error || '未知原因'}`)
+        }
+    }
+    if (fixed > 0) invalidateLibraryCache()
+    for (const r of rows) {
+        if (r.albumId != null && r.complete === false) {
+            log.info(`库里《${r.name}》还没下完：${r.audio}/${r.total} 集，还差 ${r.remaining} 集`
+                + `　—— 要接着下就在网页「库中已有书籍」里点「继续下载」（专辑 ${r.albumId}）`)
+        }
+    }
+    return rows
 }
 
 async function main() {
@@ -827,6 +941,16 @@ async function main() {
         if (roundMax <= 0 && maxPerRound > 0) roundMax = maxPerRound
         // 账号目录 + 共用的进度库，跟着这次 spawn 传下去 —— 多账号能跑起来全靠这两个变量
         const accountEnv = {XMD_XMD_DIR: accountDirs[account], XMD_DB_DIR: dbDir}
+        // 顺手照顾「库里已有的书」（2026-09-30）：缺封面/简介/主播的补上，没下完的只提示一句。
+        // 放在这里而不是轮次开头，是因为它要借上面这个账号的凭据去请求专辑详情。
+        // 队列空着也照跑 —— 已经下完的书重跑一次就能把封面补上，不必等新专辑。
+        if (!opts.dryRun) {
+            try {
+                await refreshLibrary(opts, accountEnv)
+            } catch (e) {
+                log.warn(`扫下载目录失败（不影响本轮下载）：${e.message}`)
+            }
+        }
         let failed = 0
         let gotThisRound = 0
         let cappedThisRound = false

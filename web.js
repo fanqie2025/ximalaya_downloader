@@ -38,6 +38,9 @@ import {
     findCredential,
     dbDir as sharedDbDir,
 } from './common/accountstore.js'
+import {loadAlbumMeta} from './common/naming.js'
+import {assetSummary} from './common/albumassets.js'
+import {identifyLibrary, invalidateLibraryCache, scanLibrary} from './common/library.js'
 
 /** 容器里以 root 跑，写出来的文件属主要拉回宿主机用户，否则以后不好直接编辑 */
 const OWNER = {uid: 1000, gid: 1001}
@@ -251,6 +254,8 @@ function buildState() {
         accounts: collectAccounts(),
         probing: state.probing || null,
         accountsFile: accountsFile(),
+        // 库里已有的书（v8）：下载目录里有什么、下完没有。60 秒缓存，轮询页面不会一直扫盘。
+        library: collectLibrary(false),
         summary: {
             done: totalDone,
             total: totalAll,
@@ -410,6 +415,102 @@ function accountView(name) {
 
 function collectAccounts() {
     return readAccounts().map(accountView)
+}
+
+// ------------------------------------------------------- 库里已有的书（v8）
+// 面板上「库中已有书籍」直接看下载目录，不看订阅列表 —— 订阅列表只说明「打算下什么」，
+// 这张卡片回答的是「盘里到底有什么、下完没有」。认专辑的顺序：sidecar → 目录名吻合
+// （按书名去搜喜马拉雅这条路走不通，风控直接回 risk invalid，所以对不上就得手工绑定）。
+
+/** 下载目录（config.archives）。跟调度器算的是同一个地方，改一处要记得另一处 */
+function archivesDir() {
+    return path.resolve(String(config.archives || '~/Downloads').replace('~', os.homedir()))
+}
+
+/** 进度库里的专辑记录。web.js 刻意不 import nedb，一律把 db 文件当 NDJSON 读 */
+function albumDocs() {
+    const base = path.join(dbDirPath(), 'db', 'file')
+    return [...readNedb(path.join(base, 'album.db')).values()]
+}
+
+function collectLibrary(force = false) {
+    const root = archivesDir()
+    try {
+        const rows = identifyLibrary(scanLibrary(root, {force}), albumDocs(), loadAlbumMeta())
+        return {root, rows}
+    } catch (e) {
+        log.warn(`扫下载目录失败：${e.message}`)
+        return {root, rows: [], error: e.message}
+    }
+}
+
+/** 补附件要借一个账号的凭据：挑第一个有凭据的就行（调度器那边才需要按轮转挑）*/
+function pickJobAccount() {
+    const names = readAccounts()
+    for (const n of names) {
+        if (findCredential(accountDirFor(n)) != null) return n
+    }
+    return names.length > 0 ? names[0] : null
+}
+
+/** 跑 assets.js 补封面/简介/主播，读它最后打的那行 XMD_ASSETS={...} */
+function runAssetsJob(name, albumId, dir) {
+    return new Promise(resolve => {
+        let child
+        try {
+            child = spawn(process.execPath, ['assets.js', String(albumId), dir], {
+                cwd: projectRoot,
+                env: {...process.env, XMD_XMD_DIR: accountDirFor(name), XMD_DB_DIR: sharedDbDir()},
+                stdio: ['ignore', 'pipe', 'pipe'],
+            })
+        } catch (e) {
+            return resolve({ok: false, error: e.message})
+        }
+        let buf = ''
+        let settled = false
+        const done = out => {
+            if (settled) return
+            settled = true
+            clearTimeout(timer)
+            resolve(out)
+        }
+        const timer = setTimeout(() => {
+            try {
+                child.kill('SIGKILL')
+            } catch (e) {
+                // 已经退了
+            }
+            done({ok: false, error: '补封面超时（90 秒）'})
+        }, 90000)
+        const onData = c => {
+            const s = c.toString()
+            buf += s
+            process.stdout.write(s)
+        }
+        child.stdout.on('data', onData)
+        child.stderr.on('data', onData)
+        child.on('error', e => done({ok: false, error: e.message}))
+        child.on('close', code => {
+            const m = /XMD_ASSETS=(\{.*\})/m.exec(buf)
+            let out = null
+            if (m) {
+                try {
+                    out = JSON.parse(m[1])
+                } catch (e) {
+                    out = null
+                }
+            }
+            done(out || {ok: false, error: `assets.js 退出码 ${code}`})
+        })
+    })
+}
+
+/** 这个接口会往目录里写文件，所以目录必须在下载目录之下，别的路径一律拒绝 */
+function insideArchives(dir) {
+    const root = archivesDir()
+    const p = path.resolve(String(dir == null ? '' : dir))
+    if (p === root) return null
+    return p.startsWith(root + path.sep) ? p : null
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -807,6 +908,35 @@ async function handle(req, res) {
         return sendJson(res, 200, {ok: true, data: collectAccounts(), fingerprint: fp})
     }
 
+    // ------------------------------------------------------ 库里已有的书（v8）
+
+    if (method === 'GET' && p === '/api/library') {
+        const force = /[?&]force=1/.test(req.url || '')
+        return sendJson(res, 200, {ok: true, data: collectLibrary(force)})
+    }
+
+    // 绑定专辑：目录名跟专辑名对不上时，手工告诉程序「这个目录是哪张专辑」。
+    // 绑定会写 sidecar（下次扫库就认得），顺带把封面/简介/主播补上。
+    if (method === 'POST' && p === '/api/library/bind') {
+        const body = await readBody(req)
+        const dir = insideArchives(body.dir)
+        if (dir == null) return sendJson(res, 400, {ok: false, msg: '目录不在下载目录之下'})
+        const albumId = parseAlbumId(body.albumId)
+        if (albumId == null) return sendJson(res, 400, {ok: false, msg: 'albumId 不对（填数字或专辑链接）'})
+        const name = pickJobAccount()
+        if (name == null) return sendJson(res, 400, {ok: false, msg: '还没有账号，先去「账号」卡片加一个'})
+        const out = await runAssetsJob(name, albumId, dir)
+        const sum = out.ok ? assetSummary(out) : ''
+        if (!out.ok) {
+            log.warn(`网页操作：把《${path.basename(dir)}》绑定到专辑 ${albumId} 失败：${out.error}`)
+            return sendJson(res, 400, {ok: false, msg: out.error || '绑定失败', data: collectLibrary(true)})
+        }
+        log.info(`网页操作：把《${path.basename(dir)}》绑定到专辑 ${albumId}`
+            + `（《${out.albumTitle || ''}》，用账号 ${name}）${sum === '' ? '' : `，补上：${sum}`}`)
+        invalidateLibraryCache()
+        return sendJson(res, 200, {ok: true, data: collectLibrary(true), result: out})
+    }
+
     if (p.startsWith('/api/')) return sendJson(res, 404, {ok: false, msg: '没有这个接口'})
 
     res.writeHead(302, {Location: '/'})
@@ -995,6 +1125,19 @@ textarea:focus{outline:none;border-color:var(--accent)}
   </div>
 
   <div class="card">
+    <h2>库中已有书籍</h2>
+    <div class="row">
+      <span class="chip" id="chip-lib">-</span>
+      <span class="spacer"></span>
+      <button id="btn-lib-scan">重新扫描</button>
+    </div>
+    <div id="library" style="margin-top:10px"><div class="empty">加载中…</div></div>
+    <div class="hint">这一栏看的是下载目录里实际有什么，不是订阅列表。下完的书安安静静待着；
+      没下完的会标出还差多少集、给个「继续下载」—— 点一下才进队列，程序不会自己开工。
+      目录名跟专辑名对不上的，点「绑定专辑」填一次 ID 就记住了（顺带补上封面和简介）。</div>
+  </div>
+
+  <div class="card">
     <h2>添加订阅</h2>
     <div class="row">
       <input type="text" id="in-album" placeholder="粘贴专辑链接，或直接填专辑 ID（如 22216262）" autocomplete="off">
@@ -1106,6 +1249,7 @@ function render(st){
 
   renderAlbums(st)
   renderAccounts(st)
+  renderLibrary(st)
 }
 
 function renderAlbums(st){
@@ -1146,6 +1290,101 @@ function renderAlbums(st){
   Array.prototype.forEach.call(box.querySelectorAll('button[data-remove]'), function(b){
     b.onclick = function(){ removeAlbum(b.getAttribute('data-remove')) }
   })
+}
+
+// 「库中已有书籍」：下完的只列出来不打扰，没下完的给个「继续下载」，
+// 认不出专辑的给个「绑定专辑」入口。
+function renderLibrary(st){
+  var lib = st.library || {rows: []}
+  var rows = lib.rows || []
+  var box = $('library')
+  $('chip-lib').textContent = rows.length + ' 本'
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">下载目录里还没有书（' + esc(lib.root || '-') + '）</div>'
+    return
+  }
+  var subs = {}
+  ;(st.albums || []).forEach(function(a){ subs[String(a.albumId)] = true })
+  var html = ''
+  rows.forEach(function(r, i){
+    var badge
+    var btn = ''
+    if (r.complete === true) {
+      badge = '<span class="badge ok">已下完 ' + r.audio + '/' + r.total + '</span>'
+    } else if (r.complete === false) {
+      badge = '<span class="badge off">未下完 ' + r.audio + '/' + r.total + '，还差 ' + r.remaining + '</span>'
+      if (subs[String(r.albumId)]) btn = '<button disabled>已在订阅列表</button>'
+      else btn = '<button class="primary" data-lib-go="' + i + '">继续下载</button>'
+    } else {
+      badge = '<span class="badge">未识别是哪张专辑</span>'
+      btn = '<button data-lib-bind="' + i + '">绑定专辑</button>'
+    }
+    var marks = (r.hasCover ? '封面 ✓' : '封面 ✗') + '　·　'
+      + (r.hasDesc ? '简介 ✓' : '简介 ✗') + '　·　'
+      + (r.hasReader ? '主播 ✓' : '主播 ✗')
+    html += '<div class="acc">'
+      + '<div class="acc-h"><span class="acc-n">' + esc(r.name) + '</span>' + badge + '</div>'
+      + '<div class="acc-sub">' + r.audio + ' 个音频'
+      + (r.albumId ? '　·　专辑 ' + esc(String(r.albumId))
+          + (r.matchedBy === 'sidecar' ? '（手工绑定过）' : '') : '')
+      + '　·　' + marks + '</div>'
+      + '<div class="acc-b">' + btn + '</div>'
+      + '</div>'
+  })
+  box.innerHTML = html
+  Array.prototype.forEach.call(box.querySelectorAll('button[data-lib-go]'), function(b){
+    b.onclick = function(){ libContinue(Number(b.getAttribute('data-lib-go'))) }
+  })
+  Array.prototype.forEach.call(box.querySelectorAll('button[data-lib-bind]'), function(b){
+    b.onclick = function(){ libBind(Number(b.getAttribute('data-lib-bind'))) }
+  })
+}
+
+// 继续下载 = 把专辑 ID 加进订阅列表（跟「添加订阅」走同一个接口）
+function libContinue(i){
+  var r = (lastState.library && lastState.library.rows[i]) || null
+  if (!r || !r.albumId) return
+  act('/api/albums', {input: String(r.albumId)}, '已加入订阅队列，下一轮就接着下')
+}
+
+// 绑定专辑：目录名跟专辑名对不上时手工指定一次，写进目录里的 .xmd-album.json
+function libBind(i){
+  var r = (lastState.library && lastState.library.rows[i]) || null
+  if (!r) return
+  openModal('绑定专辑：' + r.name,
+    '<div class="hint">这一个目录名跟专辑名对不上，程序认不出它。填一次专辑 ID（或直接粘贴专辑链接），'
+    + '绑定信息会写进目录里的 .xmd-album.json，顺便把封面/简介补上，以后不用再填。</div>'
+    + '<div class="row" style="margin-top:10px">'
+    + '<input type="text" id="lib-bind-id" placeholder="专辑 ID 或链接，如 86991161" autocomplete="off">'
+    + '<button class="primary" id="lib-bind-ok">绑定</button></div>'
+    + '<div class="hint mono">' + esc(r.dir) + '</div>')
+  $('lib-bind-id').focus()
+  $('lib-bind-id').onkeydown = function(e){ if (e.key === 'Enter') $('lib-bind-ok').click() }
+  $('lib-bind-ok').onclick = function(){
+    var v = $('lib-bind-id').value.trim()
+    if (v === '') { toast('先填专辑 ID', true); return }
+    $('lib-bind-ok').disabled = true
+    busy = true
+    fetch('/api/library/bind', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({dir: r.dir, albumId: v})
+    }).then(function(x){ return x.json() }).then(function(x){
+      busy = false
+      if (x && x.ok) {
+        var out = x.result || {}
+        toast('绑定成功：《' + (out.albumTitle || r.name) + '》')
+        closeModal()
+        refresh()
+      } else {
+        $('lib-bind-ok').disabled = false
+        toast((x && x.msg) || '绑定失败', true)
+      }
+    }).catch(function(e){
+      busy = false
+      $('lib-bind-ok').disabled = false
+      toast('请求出错：' + e.message, true)
+    })
+  }
 }
 
 function refresh(){
@@ -1523,6 +1762,13 @@ $('btn-add').onclick = addAlbum
 $('in-album').addEventListener('keydown', function(e){ if (e.key === 'Enter') addAlbum() })
 $('btn-acc-add').onclick = accAdd
 $('in-acc').addEventListener('keydown', function(e){ if (e.key === 'Enter') accAdd() })
+// 重新扫描：绕开 60 秒缓存，立刻重扫下载目录（比如刚手工往里放了文件）
+$('btn-lib-scan').onclick = function(){
+  fetch('/api/library?force=1', {cache:'no-store'}).then(function(r){ return r.json() }).then(function(r){
+    if (r && r.ok) { toast('扫到 ' + (r.data.rows || []).length + ' 本'); refresh() }
+    else toast('扫描失败', true)
+  }).catch(function(e){ toast('请求出错：' + e.message, true) })
+}
 $('modal-close').onclick = closeModal
 $('mask').addEventListener('click', function(e){ if (e.target === $('mask')) closeModal() })
 document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeModal() })
