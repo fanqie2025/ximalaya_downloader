@@ -1241,7 +1241,9 @@ function render(st){
   var hints = []
   if (st.albumId) hints.push('当前专辑 ' + st.albumId)
   if (st.current) {
-    hints.push('本专辑进度 ' + st.current.done + '/' + st.current.total + '（' + st.current.pct + '%）')
+    // 谁在下（v9.1）：多账号换号之后，光看「本专辑进度」不知道是哪个账号在推
+    hints.push('本专辑进度（账号 ' + (st.current.account || st.sched?.account || '?') + '） '
+      + st.current.done + '/' + st.current.total + '（' + st.current.pct + '%）')
     if (st.current.title) hints.push('最近：' + st.current.title)
   }
   if (st.sleepReason) hints.push(st.sleepReason)

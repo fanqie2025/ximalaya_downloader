@@ -72,6 +72,9 @@ function childEnv(extra) {
 
 let currentChild = null
 
+// 这一轮是哪个账号在跑（给页面显示「谁在下」用；子进程的日志行自带账号标签，见 common/log4jscf.js）
+let currentAccountName = null
+
 // 本轮**真正下到**的集数。
 // 必须认「下载成功」这三个字：日志里还有「当前信息>>>>>进度:」这类同样能匹配
 // RE_PROGRESS 的行（专辑已下完时每轮都会打一行），只按 RE_PROGRESS 数会虚高 ——
@@ -206,6 +209,9 @@ function onChildLine(line) {
             total: Number(p[3]),
             pct: Number(p[1]),
             title: t ? path.basename(t[1].trim()) : (state.current ? state.current.title : null),
+            // 谁在下（v9.1）：面板上「本专辑进度」那一行会带上账号名 ——
+            // 换账号顶上之后，一眼能看出进度是哪个账号推进的
+            account: currentAccountName,
             at: Date.now(),
         }
     }
@@ -247,6 +253,7 @@ function runAlbum(albumId, opts) {
             stdio: ['ignore', 'pipe', 'pipe'],
         })
         currentChild = child
+        currentAccountName = opts.account || null
         state.albumId = String(albumId)
         state.phase = 'planning'
         state.current = null
@@ -1000,7 +1007,9 @@ async function main() {
         // 而是「用户偏要跑」，所以退回单轮上限。（dailyCap 关掉时本来就不会是 0）
         if (roundMax <= 0 && maxPerRound > 0) roundMax = maxPerRound
         // 账号目录 + 共用的进度库，跟着这次 spawn 传下去 —— 多账号能跑起来全靠这两个变量
-        const accountEnv = {XMD_XMD_DIR: accountDirs[account], XMD_DB_DIR: dbDir}
+        // XMD_ACCOUNT 只用来给子进程的**日志每一行**打上账号标签（见 common/log4jscf.js）：
+        // 两个账号的行交错刷，光靠轮次分隔线认不出「这条 1001 是谁撞的」。
+        const accountEnv = {XMD_XMD_DIR: accountDirs[account], XMD_DB_DIR: dbDir, XMD_ACCOUNT: account}
         // 顺手照顾「库里已有的书」（2026-09-30）：缺封面/简介/主播的补上，没下完的只提示一句。
         // 放在这里而不是轮次开头，是因为它要借上面这个账号的凭据去请求专辑详情。
         // 队列空着也照跑 —— 已经下完的书重跑一次就能把封面补上，不必等新专辑。
