@@ -53,7 +53,10 @@ QUALITY_LABELS = {
 }
 QUALITY_FROM_LABEL = {v: k for k, v in QUALITY_LABELS.items()}
 
-FEINI_HOST = "wangxun@192.168.10.111"
+# 飞牛（NAS）主机，形如「用户名@地址」。公开仓库里不放真实地址：由
+# settings.local.json 的 nasHost（该文件在 .gitignore 里）或环境变量
+# XMD_FEINI_HOST 提供；两处都没配就停下来提示，不瞎猜一个地址去连。
+FEINI_HOST_ENV = "XMD_FEINI_HOST"
 ABS_LIB = "/vol1/1000/youshengshu"
 # 飞牛上自动下载容器的项目目录（凭据与设备指纹都往这里放）。
 # 注意是 /vol2 —— 飞牛的 docker 项目统一放 /vol2/1000/docker/，
@@ -66,6 +69,8 @@ DEVICE_INFO = Path.home() / ".xmd" / "device-info.json"
 
 DEFAULT_SETTINGS = {
     "archives": "",
+    # 飞牛主机（用户名@地址），推送 ABS 库和设备指纹时用。空 = 还没配。
+    "nasHost": "",
     "quality": {"mode": "high", "paidLevel": 1},
     "naming": {
         "template": "《{title}》{anchor} {author}",
@@ -161,6 +166,20 @@ def save_settings(archives: str, quality_mode: str, paid_level: int = 1) -> None
     )
 
 
+def feini_host() -> str:
+    """飞牛主机（用户名@地址）。环境变量优先，其次 settings.local.json 的 nasHost。
+
+    每次调用现读，改完设置不用重启；都没配就返回空串，由调用方提示。
+    """
+    env = (os.environ.get(FEINI_HOST_ENV) or "").strip()
+    if env:
+        return env
+    try:
+        return str(load_settings().get("nasHost") or "").strip()
+    except Exception:
+        return ""
+
+
 # ---------------------------------------------------------------- 补零重命名
 
 def fix_numbering(album_dir, log=print) -> int:
@@ -238,7 +257,12 @@ def push_to_nas(album_dir, lib=ABS_LIB, log=print) -> int:
     if not album_dir.is_dir():
         log(f"[!] 目录不存在，跳过推送：{album_dir}")
         return 1
-    dest = f"{FEINI_HOST}:{lib}/"
+    host = feini_host()
+    if not host:
+        log(f"[!] 还没配置飞牛主机：在 settings.local.json 里写 "
+            f"\"nasHost\": \"用户名@地址\"，或设环境变量 {FEINI_HOST_ENV}")
+        return 1
+    dest = f"{host}:{lib}/"
     log(f"[*] 推送到飞牛 {dest}（可能要一会儿）")
     rc = subprocess.call(
         ["scp", "-r", "-o", "BatchMode=yes", str(album_dir), dest],
@@ -261,7 +285,12 @@ def push_device_info(src=None, log=print) -> int:
     if not src.exists():
         log(f"[!] 指纹文件不存在：{src}")
         return 1
-    dest = f"{FEINI_HOST}:{FNOS_XMD_DIR}/device-info.json"
+    host = feini_host()
+    if not host:
+        log(f"[!] 还没配置飞牛主机：在 settings.local.json 里写 "
+            f"\"nasHost\": \"用户名@地址\"，或设环境变量 {FEINI_HOST_ENV}")
+        return 1
+    dest = f"{host}:{FNOS_XMD_DIR}/device-info.json"
     log(f"[*] 同步到飞牛 {dest}")
     rc = subprocess.call(
         ["scp", "-o", "BatchMode=yes", str(src), dest],

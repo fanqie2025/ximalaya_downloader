@@ -102,7 +102,7 @@ class App:
                         variable=self.var_slow).pack(anchor="w")
         ttk.Checkbutton(opt, text="补零重命名（新下载已自动补零，勾上=顺带修历史文件）",
                         variable=self.var_fix).pack(anchor="w")
-        ttk.Checkbutton(opt, text="下载完推送到飞牛 ABS 库（192.168.10.111）",
+        ttk.Checkbutton(opt, text="下载完推送到飞牛 ABS 库（主机在 settings.local.json 的 nasHost）",
                         variable=self.var_push).pack(anchor="w")
 
         # 按钮
