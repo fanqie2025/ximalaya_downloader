@@ -40,7 +40,7 @@ import {
 } from './common/accountstore.js'
 import {loadAlbumMeta} from './common/naming.js'
 import {assetSummary} from './common/albumassets.js'
-import {identifyLibrary, invalidateLibraryCache, scanLibrary} from './common/library.js'
+import {identifyLibrary, invalidateLibraryCache, scanLibrary, writeSkip} from './common/library.js'
 
 /** 容器里以 root 跑，写出来的文件属主要拉回宿主机用户，否则以后不好直接编辑 */
 const OWNER = {uid: 1000, gid: 1001}
@@ -937,6 +937,26 @@ async function handle(req, res) {
         return sendJson(res, 200, {ok: true, data: collectLibrary(true), result: out})
     }
 
+    // 「非本站」标记：番茄唱听这类不是喜马拉雅来的书，永远拿不到 albumId、绑不上专辑，
+    // 老把它列成「未识别，等着绑」就是一条永远清不掉的假待办。标记只在目录里放一个
+    // `.xmd-skip`，音频文件一个都不动（ABS 照常扫、照常播），面板改显示「非本站 · 已忽略」。
+    if (method === 'POST' && p === '/api/library/skip') {
+        const body = await readBody(req)
+        const dir = insideArchives(body.dir)
+        if (dir == null) return sendJson(res, 400, {ok: false, msg: '目录不在下载目录之下'})
+        const on = !(body.skip === false || body.skip === 'false' || body.skip === 0 || body.skip === '0')
+        const reason = body.reason == null ? '' : String(body.reason).trim().slice(0, 200)
+        if (!writeSkip(dir, on, reason)) {
+            return sendJson(res, 400, {ok: false, msg: '写标记失败（目录只读？）', data: collectLibrary(true)})
+        }
+        const base = path.basename(dir)
+        log.info(on
+            ? `网页操作：《${base}》标记为非本站（${reason === '' ? '没写来源' : reason}）`
+            : `网页操作：《${base}》取消了「非本站」标记`)
+        invalidateLibraryCache()
+        return sendJson(res, 200, {ok: true, data: collectLibrary(true), skipped: on})
+    }
+
     if (p.startsWith('/api/')) return sendJson(res, 404, {ok: false, msg: '没有这个接口'})
 
     res.writeHead(302, {Location: '/'})
@@ -1131,9 +1151,11 @@ textarea:focus{outline:none;border-color:var(--accent)}
       <span class="spacer"></span>
       <button id="btn-lib-scan">重新扫描</button>
     </div>
+    <div class="row" id="lib-tabs" style="margin-top:8px"></div>
     <div id="library" style="margin-top:10px"><div class="empty">加载中…</div></div>
-    <div class="hint">这一栏看的是下载目录里实际有什么，不是订阅列表。下完的书安安静静待着；
-      没下完的会标出还差多少集、给个「继续下载」—— 点一下才进队列，程序不会自己开工。
+    <div class="hint">这一栏看的是下载目录里实际有什么，不是订阅列表。分两页：<b>未完成</b>里是还差集数的
+      （点「继续下载」才进队列，程序不会自己开工）和认不出专辑的；<b>已完成</b>里是下完的、以及标过
+      「非本站」的。同一张专辑要是下进了两个目录，会自动合并成一条、写清还有哪几个目录，不再重复计数。
       目录名跟专辑名对不上的，点「绑定专辑」填一次 ID 就记住了（顺带补上封面和简介）。</div>
   </div>
 
@@ -1175,6 +1197,9 @@ textarea:focus{outline:none;border-color:var(--accent)}
 var $ = function(id){ return document.getElementById(id) }
 var lastState = null
 var busy = false
+// 「库中已有书籍」看哪一页：未完成 / 已完成。用户切过一次就记住（手机上看书方便）
+var libTab = 'pending'
+try { if (localStorage.getItem('xmd-lib-tab') === 'done') libTab = 'done' } catch (e) {}
 
 function esc(s){
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
@@ -1294,24 +1319,55 @@ function renderAlbums(st){
   })
 }
 
-// 「库中已有书籍」：下完的只列出来不打扰，没下完的给个「继续下载」，
-// 认不出专辑的给个「绑定专辑」入口。
+// 「库中已有书籍」分两页：下完的、标过「非本站」的进「已完成」安静待着；
+// 还差集数的、认不出专辑的进「未完成」等着处理。同一张专辑下进两个目录的，
+// 服务端（common/library.js 的 dedupeIdentified）已经合并成一条，这里只负责显示。
 function renderLibrary(st){
   var lib = st.library || {rows: []}
   var rows = lib.rows || []
   var box = $('library')
   $('chip-lib').textContent = rows.length + ' 本'
+  var pending = []
+  var done = []
+  rows.forEach(function(r, i){
+    if (r.complete === true || r.ignored) done.push({r: r, i: i})
+    else pending.push({r: r, i: i})
+  })
+  // 「未完成」里把要人拍板的（还没认出是哪张专辑）排最前，其余按还差多少集从少到多
+  pending.sort(function(a, b){
+    var am = a.r.complete === null ? 1 : 0
+    var bm = b.r.complete === null ? 1 : 0
+    if (am !== bm) return bm - am
+    var ar = a.r.remaining == null ? Number.MAX_SAFE_INTEGER : a.r.remaining
+    var br = b.r.remaining == null ? Number.MAX_SAFE_INTEGER : b.r.remaining
+    if (ar !== br) return ar - br
+    return String(a.r.name).localeCompare(String(b.r.name), 'zh')
+  })
+  done.sort(function(a, b){ return String(a.r.name).localeCompare(String(b.r.name), 'zh') })
+  renderLibTabs(pending.length, done.length)
   if (!rows.length) {
     box.innerHTML = '<div class="empty">下载目录里还没有书（' + esc(lib.root || '-') + '）</div>'
     return
   }
   var subs = {}
   ;(st.albums || []).forEach(function(a){ subs[String(a.albumId)] = true })
+  var list = libTab === 'done' ? done : pending
+  if (!list.length) {
+    box.innerHTML = '<div class="empty">' + (libTab === 'done'
+      ? '还没有下完的书。'
+      : '没有未完成的书 —— 都下完了，切到「已完成」看。') + '</div>'
+    return
+  }
   var html = ''
-  rows.forEach(function(r, i){
+  list.forEach(function(it){
+    var r = it.r
+    var i = it.i
     var badge
     var btn = ''
-    if (r.complete === true) {
+    if (r.ignored) {
+      badge = '<span class="badge">非本站 · 已忽略</span>'
+      btn = '<button data-lib-skip="' + i + '" data-skip-to="0">取消忽略</button>'
+    } else if (r.complete === true) {
       badge = '<span class="badge ok">已下完 ' + r.audio + '/' + r.total + '</span>'
     } else if (r.complete === false) {
       badge = '<span class="badge off">未下完 ' + r.audio + '/' + r.total + '，还差 ' + r.remaining + '</span>'
@@ -1320,6 +1376,7 @@ function renderLibrary(st){
     } else {
       badge = '<span class="badge">未识别是哪张专辑</span>'
       btn = '<button data-lib-bind="' + i + '">绑定专辑</button>'
+        + '<button data-lib-skip="' + i + '" data-skip-to="1">非本站·忽略</button>'
     }
     var marks = (r.hasCover ? '封面 ✓' : '封面 ✗') + '　·　'
       + (r.hasDesc ? '简介 ✓' : '简介 ✗') + '　·　'
@@ -1329,6 +1386,10 @@ function renderLibrary(st){
       + '<div class="acc-sub">' + r.audio + ' 个音频'
       + (r.albumId ? '　·　专辑 ' + esc(String(r.albumId))
           + (r.matchedBy === 'sidecar' ? '（手工绑定过）' : '') : '')
+      + (r.ignored ? '　·　非喜马拉雅来源，不绑专辑'
+          + (r.skipReason ? '（' + esc(r.skipReason) + '）' : '') : '')
+      + (r.dupes && r.dupes.length ? '　·　另有 ' + r.dupes.length + ' 个目录也是这本（'
+          + r.dupes.map(function(d){ return esc(d.name) }).join('、') + '），已合并成一条' : '')
       + '　·　' + marks + '</div>'
       + '<div class="acc-b">' + btn + '</div>'
       + '</div>'
@@ -1339,6 +1400,28 @@ function renderLibrary(st){
   })
   Array.prototype.forEach.call(box.querySelectorAll('button[data-lib-bind]'), function(b){
     b.onclick = function(){ libBind(Number(b.getAttribute('data-lib-bind'))) }
+  })
+  Array.prototype.forEach.call(box.querySelectorAll('button[data-lib-skip]'), function(b){
+    b.onclick = function(){
+      libSkip(Number(b.getAttribute('data-lib-skip')), b.getAttribute('data-skip-to') === '1')
+    }
+  })
+}
+
+// 两个页签：数字放在标签里，一眼知道还剩几本没收尾
+function renderLibTabs(nPending, nDone){
+  var box = $('lib-tabs')
+  var mk = function(key, label){
+    return '<button' + (libTab === key ? ' class="primary"' : '')
+      + ' data-lib-tab="' + key + '">' + label + '</button>'
+  }
+  box.innerHTML = mk('pending', '未完成 ' + nPending) + mk('done', '已完成 ' + nDone)
+  Array.prototype.forEach.call(box.querySelectorAll('button[data-lib-tab]'), function(b){
+    b.onclick = function(){
+      libTab = b.getAttribute('data-lib-tab')
+      try { localStorage.setItem('xmd-lib-tab', libTab) } catch (e) {}
+      renderLibrary(lastState)
+    }
   })
 }
 
@@ -1387,6 +1470,48 @@ function libBind(i){
       toast('请求出错：' + e.message, true)
     })
   }
+}
+
+// 「非本站」：番茄唱听这类不是喜马拉雅来的书，永远绑不上专辑。
+// 标记只在目录里放一个 .xmd-skip，音频文件一个都不动（ABS 照常播放）。
+function libSkip(i, on){
+  var r = (lastState.library && lastState.library.rows[i]) || null
+  if (!r) return
+  if (!on) { postSkip(r.dir, false, ''); return }
+  openModal('标记为非本站：' + r.name,
+    '<div class="hint">这本不是喜马拉雅来的（比如番茄唱听、懒人听书），永远拿不到专辑 ID。'
+    + '标记后这行显示成「非本站 · 已忽略」，面板不再催你绑定；目录里的音频一个都不动，ABS 照常扫描播放。</div>'
+    + '<div class="row" style="margin-top:10px">'
+    + '<input type="text" id="lib-skip-reason" placeholder="来源，可留空（如 番茄唱听）" autocomplete="off">'
+    + '<button class="primary" id="lib-skip-ok">标记</button></div>'
+    + '<div class="hint mono">' + esc(r.dir) + '</div>')
+  $('lib-skip-reason').focus()
+  $('lib-skip-reason').onkeydown = function(e){ if (e.key === 'Enter') $('lib-skip-ok').click() }
+  $('lib-skip-ok').onclick = function(){
+    $('lib-skip-ok').disabled = true
+    postSkip(r.dir, true, $('lib-skip-reason').value.trim())
+  }
+}
+
+function postSkip(dir, on, reason){
+  if (busy) return
+  busy = true
+  fetch('/api/library/skip', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({dir: dir, skip: on, reason: reason})
+  }).then(function(x){ return x.json() }).then(function(x){
+    busy = false
+    if (x && x.ok) {
+      toast(on ? '已标记为非本站，不再提醒绑定' : '已取消「非本站」标记')
+      closeModal()
+      refresh()
+    } else {
+      toast((x && x.msg) || '操作失败', true)
+    }
+  }).catch(function(e){
+    busy = false
+    toast('请求出错：' + e.message, true)
+  })
 }
 
 function refresh(){

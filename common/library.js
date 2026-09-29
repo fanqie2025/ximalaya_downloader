@@ -57,6 +57,49 @@ export function writeSidecar(dir, album) {
     }
 }
 
+/**
+ * 「非本站」标记：这个目录不是喜马拉雅来的（番茄唱听、懒人听书…），永远绑不上专辑。
+ * 面板上给它一个收尾动作 —— 在目录里放一个 `.xmd-skip`，扫库时这行就显示成
+ * 「非本站 · 已忽略」，不再催用户绑定。**只是个小标记，音频文件一个都不动。**
+ */
+export const SKIP_NAME = '.xmd-skip'
+
+/** 读标记：没有就返回 null；有就返回 {reason, at}（文件被人手写过非 JSON 也认，整段当 reason） */
+export function readSkip(dir) {
+    try {
+        const p = path.join(dir, SKIP_NAME)
+        if (!fs.existsSync(p)) return null
+        const raw = String(fs.readFileSync(p, 'utf-8')).trim()
+        if (raw === '') return {reason: '', at: null}
+        try {
+            const o = JSON.parse(raw)
+            if (o != null && typeof o === 'object') return o
+        } catch (e) {
+            // 不是 JSON 就当原因文本
+        }
+        return {reason: raw, at: null}
+    } catch (e) {
+        return null
+    }
+}
+
+/** 写/删标记。on=false 时删文件（取消忽略） */
+export function writeSkip(dir, on, reason) {
+    if (!dir) return false
+    const p = path.join(dir, SKIP_NAME)
+    try {
+        if (!on) {
+            if (fs.existsSync(p)) fs.unlinkSync(p)
+            return true
+        }
+        const data = {skip: true, reason: String(reason == null ? '' : reason), at: Date.now()}
+        fs.writeFileSync(p, JSON.stringify(data, null, 2) + '\n')
+        return true
+    } catch (e) {
+        return false
+    }
+}
+
 let cache = {root: '', at: 0, rows: []}
 
 /**
@@ -118,6 +161,7 @@ export function scanLibrary(root, opts = {}) {
             dir: full,
             audio, files: files_, images, hasCover, hasDesc, hasReader, mtimeMs,
             sidecar: readSidecar(full),
+            skip: readSkip(full),
         })
     }
     rows.sort((a, b) => b.mtimeMs - a.mtimeMs || a.name.localeCompare(b.name, 'zh'))
@@ -128,6 +172,49 @@ export function scanLibrary(root, opts = {}) {
 /** 面板「刷新」用：下次一定重扫 */
 export function invalidateLibraryCache() {
     cache = {root: '', at: 0, rows: []}
+}
+
+/** 同一本书的两个目录里，哪条更该当「这本书本体」：下完的优先，其次音频多的 */
+function rankOf(r) {
+    return (r.complete === true ? 1000000 : 0) + (Number(r.audio) || 0)
+}
+
+/**
+ * 去重：同一张专辑被下进了两个目录（比如下到一半改了名、或者早先用别的工具下过一份），
+ * 面板上就会一本出现在「已完成」、另一本出现在「未完成」——同一本书算了两本。
+ *
+ * 按专辑身份合并（有 albumId 认 albumId，都没有才拿目录名当身份），
+ * 留下最完整的那条代表这本书；其余目录名挂在 dupes 上照实说明，
+ * 不隐藏、不删文件 —— 磁盘上确实有两个目录，这事得让用户看见。
+ */
+export function dedupeIdentified(list) {
+    const groups = new Map()
+    const order = []
+    for (const row of list || []) {
+        const key = row.albumId != null && row.albumId !== ''
+            ? 'id:' + row.albumId
+            : 'name:' + String(row.name == null ? '' : row.name).trim()
+        const head = groups.get(key)
+        if (head == null) {
+            const first = {...row, dupes: []}
+            groups.set(key, first)
+            order.push(first)
+            continue
+        }
+        const extra = {name: row.name, dir: row.dir, audio: row.audio, complete: row.complete}
+        if (rankOf(row) > rankOf(head)) {
+            // 新来的这条更完整：它当代表，原来那条退成「另有目录」
+            extra.name = head.name
+            extra.dir = head.dir
+            extra.audio = head.audio
+            extra.complete = head.complete
+            const kept = head.dupes
+            Object.assign(head, row, {dupes: kept.concat([extra])})
+        } else {
+            head.dupes.push(extra)
+        }
+    }
+    return order
 }
 
 /**
@@ -153,7 +240,7 @@ export function identifyLibrary(rows, albums, meta) {
         }
         if (name !== '' && !byName.has(name)) byName.set(name, a)
     }
-    return (rows || []).map(row => {
+    return dedupeIdentified((rows || []).map(row => {
         let album = null
         let matchedBy = null
         if (row.sidecar && byId.has(row.sidecar.albumId)) {
@@ -171,6 +258,7 @@ export function identifyLibrary(rows, albums, meta) {
         const albumId = album && album.albumId != null ? String(album.albumId) : null
         const total = album && Number(album.trackCount) > 0 ? Number(album.trackCount) : null
         const remaining = total == null ? null : Math.max(0, total - row.audio)
+        const ignored = row.skip != null
         return {
             ...row,
             albumId,
@@ -181,6 +269,9 @@ export function identifyLibrary(rows, albums, meta) {
             // 认不出专辑的书没法判断下没下完 —— complete 给 null，面板上按「未识别」显示
             complete: total == null ? null : row.audio >= total,
             matchedBy,
+            // 标记过「非本站」的书：面板上不再当待办（认不认得出来都一样，用户已经拍过板）
+            ignored,
+            skipReason: ignored && row.skip.reason ? String(row.skip.reason) : '',
         }
-    })
+    }))
 }
