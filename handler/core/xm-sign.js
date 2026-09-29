@@ -4,7 +4,7 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import {iaxios} from '../../common/axioscf.js'
-import {config} from '../../common/config.js'
+import {config, dbDirPath} from '../../common/config.js'
 import {CustomError} from '../../common/error.js'
 
 const REPORT_URL = 'https://hdaa.shuzilm.cn/report?v=1.2.0&e=1&c=1&r='
@@ -26,8 +26,19 @@ function aesDecrypt(buffer) {
     return Buffer.concat([decipher.update(buffer), decipher.final()])
 }
 
+// 设备指纹（device-info.json）是「设备」级的，不是「账号」级的：同一台机器上采出来的本就该是同一份。
+// 所以账号目录里没有自己那份时，自动沿用共用目录（XMD_DB_DIR，不配就是根 xmd）那份 ——
+// 加账号时就不用再把指纹拷进账号目录了。想给某个账号单独一份，直接放进它自己的目录，这里优先用它。
 function deviceInfoPath() {
-    return path.join(config.xmd.replace('~', os.homedir()), 'device-info.json')
+    const own = path.join(config.xmd.replace('~', os.homedir()), 'device-info.json')
+    if (fs.existsSync(own)) {
+        return own
+    }
+    const shared = path.join(dbDirPath(), 'device-info.json')
+    if (fs.existsSync(shared)) {
+        return shared
+    }
+    return own
 }
 
 function readDeviceInfo() {
