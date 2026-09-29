@@ -566,10 +566,23 @@ async function handle(req, res) {
         return res.end(body)
     }
 
-    if (method === 'GET' && p === '/panel/app.js') {
-        const body = readPanel('app.js')
+    // 面板的前端资源：/panel/app.js、/panel/libsplit.js 等，按盘上真实文件回
+    if (method === 'GET' && p.startsWith('/panel/')) {
+        const name = p.slice('/panel/'.length)
+        // 只认单层文件名，挡掉 ../ 和任何子目录
+        if (!/^[A-Za-z0-9._-]+$/.test(name) || name.indexOf('..') >= 0) {
+            res.writeHead(404, {'Content-Type': 'text/plain; charset=utf-8'})
+            return res.end('not found')
+        }
+        let body
+        try {
+            body = readPanel(name)
+        } catch (e) {
+            res.writeHead(404, {'Content-Type': 'text/plain; charset=utf-8'})
+            return res.end('not found')
+        }
         res.writeHead(200, {
-            'Content-Type': 'application/javascript; charset=utf-8',
+            'Content-Type': PANEL_TYPES[path.extname(name).toLowerCase()] || 'application/octet-stream',
             'Cache-Control': 'no-store',
             'Content-Length': body.length,
         })
@@ -1051,11 +1064,22 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToP
 // ---------------------------------------------------------------- 前端
 
 /**
- * 面板页面与前端脚本是真实文件（panel/index.html、panel/app.js），不是塞在
- * 模板字符串里的字符串：能直接 node --check / diff，前端语法错误提交前就能发现，
+ * 面板页面与前端脚本是真实文件（panel/index.html、panel/app.js、panel/libsplit.js），
+ * 不是塞在模板字符串里的字符串：能直接 node --check / diff，前端语法错误提交前就能发现，
  * 改样式改交互也不用在 43KB 的模板字面量里翻。按请求读盘，重建镜像后刷新即生效。
  */
 const PANEL_DIR = path.join(projectRoot, 'panel')
+
+// /panel/* 静态资源的 Content-Type
+const PANEL_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.ico': 'image/x-icon',
+}
 
 function readPanel(name) {
     return fs.readFileSync(path.join(PANEL_DIR, name))

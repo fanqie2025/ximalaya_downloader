@@ -131,12 +131,19 @@ function renderLibrary(st){
   var rows = lib.rows || []
   var box = $('library')
   $('chip-lib').textContent = rows.length + ' 本'
-  var pending = []
-  var done = []
-  rows.forEach(function(r, i){
-    if (r.complete === true || r.ignored) done.push({r: r, i: i})
-    else pending.push({r: r, i: i})
-  })
+  var subs = {}
+  ;(st.albums || []).forEach(function(a){ subs[String(a.albumId)] = true })
+  // 同一本书只显示一处：订阅列表里已经有的不在「库中已有书籍」里再列一张卡
+  // （分组在 panel/libsplit.js，纯函数、有单测）。返回的下标仍是 rows 里的原始下标。
+  var groups = splitLibRows(rows, subs)
+  var pending = groups.pending
+  var done = groups.done
+  var moved = groups.subscribed
+  var note = moved.length
+    ? '<div class="empty">另有 ' + moved.length + ' 本正在订阅下载中（'
+      + moved.map(function(it){ return esc(it.r.name) }).join('、')
+      + '），见上方「订阅列表」—— 同一本书不在这里重复显示。</div>'
+    : ''
   // 「未完成」里把要人拍板的（还没认出是哪张专辑）排最前，其余按还差多少集从少到多
   pending.sort(function(a, b){
     var am = a.r.complete === null ? 1 : 0
@@ -153,13 +160,13 @@ function renderLibrary(st){
     box.innerHTML = '<div class="empty">下载目录里还没有书（' + esc(lib.root || '-') + '）</div>'
     return
   }
-  var subs = {}
-  ;(st.albums || []).forEach(function(a){ subs[String(a.albumId)] = true })
   var list = libTab === 'done' ? done : pending
   if (!list.length) {
-    box.innerHTML = '<div class="empty">' + (libTab === 'done'
-      ? '还没有下完的书。'
-      : '没有未完成的书 —— 都下完了，切到「已完成」看。') + '</div>'
+    var msg
+    if (libTab === 'done') msg = '还没有下完的书。'
+    else if (moved.length) msg = '这里没有需要你处理的未完成书籍 —— 订阅中的 ' + moved.length + ' 本在「订阅列表」里跟着下。'
+    else msg = '没有未完成的书 —— 都下完了，切到「已完成」看。'
+    box.innerHTML = note + '<div class="empty">' + msg + '</div>'
     return
   }
   var html = ''
@@ -176,8 +183,8 @@ function renderLibrary(st){
       if (r.skipped) btn = '<button data-lib-ignore="' + i + '">单集忽略（' + r.skipped + '）</button>'
     } else if (r.complete === false) {
       badge = '<span class="badge off">未下完 ' + r.audio + '/' + r.total + '，还差 ' + r.remaining + '</span>'
-      if (subs[String(r.albumId)]) btn = '<button disabled>已在订阅列表</button>'
-      else btn = '<button class="primary" data-lib-go="' + i + '">继续下载</button>'
+      // 订阅中的书已经被 splitLibRows 挑走（在「订阅列表」里显示），走到这里的都是没订阅的
+      btn = '<button class="primary" data-lib-go="' + i + '">继续下载</button>'
       btn += '<button data-lib-ignore="' + i + '">'
         + (r.skipped ? '单集忽略（已忽略 ' + r.skipped + '）' : '忽略某几集') + '</button>'
     } else {
@@ -204,7 +211,7 @@ function renderLibrary(st){
       + '<div class="acc-b">' + btn + '</div>'
       + '</div>'
   })
-  box.innerHTML = html
+  box.innerHTML = note + html
   Array.prototype.forEach.call(box.querySelectorAll('button[data-lib-go]'), function(b){
     b.onclick = function(){ libContinue(Number(b.getAttribute('data-lib-go'))) }
   })
