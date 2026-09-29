@@ -12,6 +12,7 @@
  *       本机那份是「已生效」的，采集失败时不能把它弄坏）
  */
 import {spawn} from 'child_process'
+import dns from 'dns'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
@@ -24,8 +25,72 @@ const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
 const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
 // 端口可覆盖：9333 被别的调试实例占用时换个端口就行
 const PORT = Number(process.env.XMD_CDP_PORT || 9333)
-const PROFILE = path.join(os.tmpdir(), 'xmd-fp-profile')
+
+// 用哪个浏览器采：XMD_FP_BROWSER=edge|chrome|完整路径，不设就沿用老规矩（有 Edge 就用 Edge）。
+// 这台机器上两个浏览器各采一份 = 两份不一样的指纹（UA、插件那几项会变），
+// 多账号时正好一个账号一份（见 SKILL §5 多账号）。
+const BROWSER = String(process.env.XMD_FP_BROWSER || '').trim()
+function pickExe() {
+    const b = BROWSER.toLowerCase()
+    if (b === 'edge') return EDGE
+    if (b === 'chrome') return CHROME
+    if (BROWSER) return BROWSER
+    return fs.existsSync(EDGE) ? EDGE : CHROME
+}
+const exe = pickExe()
+const browserKey = /msedge/i.test(exe) ? 'edge' : (/chrome/i.test(exe) ? 'chrome' : 'browser')
+// profile 必须按浏览器分开：Edge 和 Chrome 共用一个 user-data-dir 会互相打架
+const PROFILE = path.join(os.tmpdir(), `xmd-fp-profile-${browserKey}`)
 const TARGET_URL = 'https://www.ximalaya.com'
+
+// 风控上报域在本机被 AdGuardHome 当 tracker 打死了（系统 DNS 回 0.0.0.0 / ::）。
+// 后果很隐蔽：页面能开、SDK 能就绪、字段也能填，但 **SDK 自己那次上报发不出去**，
+// 于是采到的 GJ2 / fd2 是空的 —— 这种指纹拿去容器里上报，服务端会「收下（err:0）
+// 但不给 aid/cadd」，付费接口照样用不了。所以采集时自己解一个真地址，只给这个
+// 浏览器窗口加一条 --host-resolver-rules，不动系统 DNS、不动 AdGuardHome。
+//   XMD_FP_MAP=off          关掉（想完全按老样子采就设它）
+//   XMD_FP_MAP=host=1.2.3.4 手动指定，不管 DNS
+const FP_MAP_HOST = process.env.XMD_FP_MAP_HOST || 'hdaa.shuzilm.cn'
+const FP_MAP_DNS = String(process.env.XMD_FP_MAP_DNS || '223.5.5.5,119.29.29.29,114.114.114.114')
+    .split(',').map(s => s.trim()).filter(Boolean)
+const FP_MAP = String(process.env.XMD_FP_MAP || '').trim()
+
+async function resolveWithFallbackDns(host) {
+    // 用系统解析器以外的 DNS 自己解，系统那份被 AdGuardHome 污染了
+    const resolver = new dns.promises.Resolver()
+    resolver.setServers(FP_MAP_DNS)
+    const ips = await resolver.resolve4(host)
+    if (!ips || !ips.length) throw new Error('没有 A 记录')
+    return ips
+}
+
+async function buildResolverRule() {
+    if (FP_MAP.toLowerCase() === 'off') {
+        log('XMD_FP_MAP=off：不绕过本机 DNS（SDK 注册上报可能失败，采出来的指纹可能不可用）')
+        return ''
+    }
+    try {
+        let host = FP_MAP_HOST
+        let ip = ''
+        if (FP_MAP) {
+            if (!FP_MAP.includes('=')) throw new Error('格式应为 host=ip 或 off')
+            const [h, v] = FP_MAP.split('=')
+            host = h.trim()
+            ip = v.trim()
+        } else {
+            const ips = await resolveWithFallbackDns(host)
+            ip = ips[0]
+            log(`兜底 DNS 解析：${host} -> ${ips.join(', ')}（取 ${ip}，只影响这次采集窗口）`)
+        }
+        if (!ip) throw new Error('没拿到地址')
+        log(`已给采集窗口加 host-resolver-rules：MAP ${host} ${ip}`)
+        return `MAP ${host} ${ip}`
+    } catch (e) {
+        log(`⚠️ 没能为 ${FP_MAP_HOST} 准备旁路地址：${e.message}`)
+        log('   继续采，但 SDK 自己那次上报大概率失败 → 采到的指纹会是「没注册过」的，容器里用不了')
+        return ''
+    }
+}
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const log = (...a) => console.log(...a)
@@ -77,6 +142,21 @@ const FILLED_EXPR = `(()=>{
   if (!ua) return 'empty(keyCount=' + Object.keys(c).length + ')'
   return 'filled:' + String(ua).slice(0, 60)
 })()`
+
+// 这份指纹到底「注册」成功没有：服务端认下 SDK 的上报后，才会把 aid/cadd 塞回 fd2、
+// 把设备号塞进 GJ2。空着 = 上报压根没发出去（典型原因：本机 DNS 把上报域挡了）。
+const REGISTERED_EXPR = `JSON.stringify((()=>{
+  const s = window.du_web_sdk
+  const c = s && (s._deviceInfoCollector ||
+      (s._checkextensions && s._checkextensions._deviceInfoCollector))
+  if (!c) return {ok: false, GJ2: '', av1: '', aid: ''}
+  return {
+    ok: true,
+    GJ2: c.GJ2 || '',
+    av1: (c.fd2 && c.fd2.av1) || '',
+    aid: (c.fd2 && c.fd2.Ja5) || '',
+  }
+})())`
 
 class CDP {
     constructor(ws) {
@@ -157,14 +237,17 @@ async function findPage() {
 }
 
 async function main() {
-    if (!fs.existsSync(EDGE) && !fs.existsSync(CHROME)) {
-        throw new Error('这台机器上没找到 Edge 或 Chrome，无法采集。\n' +
-            `  找过：${EDGE}\n        ${CHROME}`)
+    if (!fs.existsSync(exe)) {
+        throw new Error('没找到要用的浏览器，无法采集。\n' +
+            `  XMD_FP_BROWSER=${BROWSER || '(没设，自动挑)'}\n` +
+            `  实际要跑的：${exe}\n` +
+            `  备用：${EDGE}\n        ${CHROME}`)
     }
-    const exe = fs.existsSync(EDGE) ? EDGE : CHROME
-    log(`浏览器：${exe}`)
+    log(`浏览器：${exe}（${browserKey}）`)
     log(`独立 profile：${PROFILE}`)
     log('（会自己开一个浏览器窗口，采完自动关掉，不用管它）')
+
+    const resolverRule = await buildResolverRule()
 
     const child = spawn(exe, [
         `--remote-debugging-port=${PORT}`,
@@ -173,6 +256,7 @@ async function main() {
         '--no-default-browser-check',
         '--disable-sync',
         '--window-size=1280,900',
+        ...(resolverRule ? [`--host-resolver-rules=${resolverRule}`] : []),
         TARGET_URL,
     ], {stdio: 'ignore'})
 
@@ -239,11 +323,35 @@ async function main() {
         }
         log(`填充状态：${filled}`)
 
+        // 光「字段填好了」还不够，还得等 SDK 自己那次上报被服务端认下来
+        let reg = {GJ2: '', av1: '', aid: ''}
+        for (let i = 0; i < 40; i++) {
+            try {
+                reg = JSON.parse(await cdp.eval(REGISTERED_EXPR))
+            } catch (e) {
+                reg = {GJ2: '', av1: '', err: e.message}
+            }
+            if (reg.av1) break
+            if (i % 8 === 0) log(`  等 SDK 上报落地… GJ2=${reg.GJ2 || '(空)'} av1=${reg.av1 || '(空)'}`)
+            await sleep(500)
+        }
+        log(`上报状态：GJ2=${reg.GJ2 || '(空)'} aid=${reg.aid || '(空)'} cadd=${reg.av1 || '(空)'}`)
+
         const raw = await cdp.eval(COLLECT_EXPR)
         if (!raw) throw new Error('采集返回空')
         const info = JSON.parse(raw)
         const keys = Object.keys(info)
         log(`采集到 ${keys.length} 个字段`)
+
+        // 能不能用，一眼看这里：没注册成功的指纹，容器上报只拿到 err:0、没有 cadd
+        const registered = Boolean(info.GJ2) && Boolean(info.fd2 && info.fd2.av1)
+        log(`XMD_FP_REGISTERED=${registered ? 1 : 0}`)
+        if (!registered) {
+            log('⚠️ 这份指纹是「没注册过」的：GJ2 / fd2.av1 是空的，说明 SDK 自己那次上报没落地。')
+            log('   容器拿它上报会被「收下但不给 cadd」，付费接口用不了 —— 别拿它给账号用。')
+            log('   先查本机 DNS 有没有把 hdaa.shuzilm.cn 挡掉（AdGuardHome 常把它当 tracker），')
+            log('   或直接指定地址重采：XMD_FP_MAP=hdaa.shuzilm.cn=123.56.155.222')
+        }
 
         fs.writeFileSync(OUT, JSON.stringify(info), 'utf8')
         log(`已写入：${OUT}`)

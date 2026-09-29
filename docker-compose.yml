@@ -108,9 +108,13 @@ services:
       #
       # 加第二个账号：
       #   1) 本机（要有屏幕，得扫码）：XMD_XMD_DIR=xmd/accounts/bob node login.js
-      #   2) 把 www2-cookies.json / mac-cookies.json / device-info.json 拷到
+      #   2) 把 www2-cookies.json / mac-cookies.json 拷到
       #      飞牛:/vol2/1000/docker/ximalaya-auto/xmd/accounts/bob/
-      #      （device-info.json 直接复用 default 那份就行，同一台机器本来就是同一个指纹）
+      #      device-info.json 不拷也行 —— 账号目录里没有就自动用根目录那份
+      #      （同一台机器本来就是同一个指纹）。想让 bob 算另一台设备：
+      #      本机 XMD_FP_BROWSER=chrome node collect-fingerprint.js 另采一份丢进
+      #      accounts/bob/，但采集时必须能连上 hdaa.shuzilm.cn（见 SKILL §2），
+      #      连不上采出来的指纹是「没注册过」的，容器里用不了。
       #   3) 这行改成 "default,bob"，再 docker compose -p ximalaya-auto up -d
       #      —— 只动环境变量，不用 build
       # 某个账号凭据没配好时只会跳过它（日志里 log.error），其它账号照常跑。
