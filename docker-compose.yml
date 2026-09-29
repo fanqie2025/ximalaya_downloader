@@ -118,7 +118,7 @@ services:
       #   3) 这行改成 "default,bob"，再 docker compose -p ximalaya-auto up -d
       #      —— 只动环境变量，不用 build
       # 某个账号凭据没配好时只会跳过它（日志里 log.error），其它账号照常跑。
-      XMD_SCHEDULE_ACCOUNTS: "default"
+      XMD_SCHEDULE_ACCOUNTS: "default,bob"
       # 占位符：{title} {anchor} {author} {count} {status}
       XMD_NAMING_TEMPLATE: "《{title}》{anchor} {author}"
     volumes:
